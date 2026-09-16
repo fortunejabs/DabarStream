@@ -1,0 +1,15 @@
+# Core (required for importer + server + tests)
+flask
+flask-socketio
+python-socketio
+pytest
+
+# Local capture client (Windows streaming machine)
+# NOTE: requires Python 3.10-3.13; wheels for 3.15 beta may not exist yet.
+numpy
+pyaudio
+faster-whisper
+
+# Optional: global hotkey language switching (1=eng 2=bem 3=nya 4=ton).
+# client.py degrades gracefully and disables hotkeys if this is absent.
+pynput

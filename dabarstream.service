@@ -1,0 +1,25 @@
+[Unit]
+Description=DabarStream Cloud WebSocket Engine (Flask-SocketIO) - multilingual Bible overlay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to wherever you place the app on the VPS
+User=dabarstream
+Group=dabarstream
+WorkingDirectory=/opt/dabarstream
+# Uses the system python3 on Oracle Linux 10; alternatively point to a venv:
+# ExecStart=/opt/dabarstream/.venv/bin/python /opt/dabarstream/server.py
+ExecStart=/usr/bin/python3 /opt/dabarstream/server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

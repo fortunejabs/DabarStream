@@ -1,0 +1,36 @@
+# Python virtual environments (recreate per machine; never commit)
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local runtime/test artifacts
+*.log
+validation_result.txt
+bible.db
+*.db
+*.sqlite
+*.sqlite3
+*.bible
+
+# Local settings and secrets
+.env
+.env.*
+secrets.json
+config.local.*
+credentials.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
