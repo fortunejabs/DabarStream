@@ -101,6 +101,62 @@ def test_detect_language_command_english(client):
     assert client.detect_language_command("let us read in English") == "eng"
 
 
+def test_client_emits_carry_stream_key(client, monkeypatch):
+    """Every outbound control emit must include the shared secret."""
+    monkeypatch.setattr(client, "STREAM_KEY", "s3cret")
+    client.switch_language("bem")
+    assert ("set_language", {"lang": "bem", "key": "s3cret"}) in client.recorder.events
+
+    model = _FakeModel(["John 3:16"])
+    client.process_audio(b"audio", model)
+    verse_events = [p for e, p in client.recorder.events if e == "verse_triggered"]
+    assert verse_events and all(p.get("key") == "s3cret" for p in verse_events)
+
+
+def test_parse_verse_reference_digits(client):
+    assert client.parse_verse_reference("John 3:16") == ("John", "3", "16")
+
+
+def test_parse_verse_reference_spoken_number_words(client):
+    book, chapter, verse = client.parse_verse_reference(
+        "John chapter three verse sixteen"
+    )
+    assert book.lower() == "john"
+    assert (chapter, verse) == ("3", "16")
+
+
+def test_parse_verse_reference_compound_numbers(client):
+    book, chapter, verse = client.parse_verse_reference(
+        "Psalms twenty three verse one"
+    )
+    assert book.lower() == "psalms"
+    assert (chapter, verse) == ("23", "1")
+
+
+def test_words_to_number_edge_cases(client):
+    assert client.words_to_number("twenty-one") == 21
+    assert client.words_to_number("one hundred and fifty") == 150
+    assert client.words_to_number("hallelujah") is None
+    assert client.words_to_number("") is None
+
+
+def test_verse_trigger_carries_stream_key(client):
+    model = _FakeModel(["John 3:16"])
+    client.process_audio(b"audio", model)
+    verse_events = [p for e, p in client.recorder.events if e == "verse_triggered"]
+    assert len(verse_events) == 1
+    assert verse_events[0]["key"] == client.STREAM_KEY
+
+
+def test_spoken_words_become_verse_trigger(client):
+    model = _FakeModel(["Yohane chapter three verse sixteen"])
+    client.process_audio(b"audio", model)
+    verse_events = [p for e, p in client.recorder.events if e == "verse_triggered"]
+    assert len(verse_events) == 1
+    assert verse_events[0]["book"].lower() == "yohane"
+    assert (verse_events[0]["chapter"], verse_events[0]["verse"]) == ("3", "16")
+
+
 def test_detect_language_command_bemba(client):
     assert client.detect_language_command("now show Bemba") == "bem"
     assert client.detect_language_command("icibemba please") == "bem"
@@ -132,7 +188,9 @@ def test_longest_phrase_wins(client):
 def test_switch_language_updates_state_and_emits(client):
     client.switch_language("bem")
     assert client.ACTIVE_LANG == "bem"
-    assert ("set_language", {"lang": "bem"}) in client.recorder.events
+    assert ("set_language", {"lang": "bem", "key": client.STREAM_KEY}) in (
+        client.recorder.events
+    )
 
 
 def test_process_audio_switches_language_then_tags_following_verses(client):
@@ -141,7 +199,9 @@ def test_process_audio_switches_language_then_tags_following_verses(client):
     returned = client.process_audio(b"audio", model)
 
     assert returned == "bem"
-    assert ("set_language", {"lang": "bem"}) in client.recorder.events
+    assert ("set_language", {"lang": "bem", "key": client.STREAM_KEY}) in (
+        client.recorder.events
+    )
 
     verse_events = [p for e, p in client.recorder.events if e == "verse_triggered"]
     assert len(verse_events) == 1
@@ -187,11 +247,217 @@ def test_normalize_lang_rejects_unknown_codes(client):
     assert normalize_lang("../../etc/passwd") is None
 
 
+def test_is_authorized_dev_mode_and_key_checks(client, monkeypatch):
+    """Unset key = local dev open mode; set key = constant-time check enforced."""
+    import server as server_module
+
+    monkeypatch.delenv(server_module.ENV_KEY_NAME, raising=False)
+    assert server_module.is_authorized({}) is True
+    assert server_module.is_authorized({"key": "anything"}) is True
+
+    monkeypatch.setenv(server_module.ENV_KEY_NAME, "s3cret")
+    assert server_module.is_authorized({"key": "s3cret"}) is True
+    assert server_module.is_authorized({"key": "wrong"}) is False
+    assert server_module.is_authorized({}) is False
+    assert server_module.is_authorized(None) is False
+    assert server_module.is_authorized("s3cret") is False
+
+
+def test_validate_verse_payload_accepts_and_normalizes(client):
+    from server import validate_verse_payload
+
+    cleaned = validate_verse_payload(
+        {"book": "  First   John ", "chapter": " 3 ", "verse": "16", "lang": "BEM"}
+    )
+    assert cleaned == {"book": "First John", "chapter": 3, "verse": 16, "lang": "bem"}
+
+    # Missing/unknown lang falls back to the server's active translation.
+    import server as server_module
+
+    monkeypatch_lang = server_module.CURRENT_LANG
+    server_module.CURRENT_LANG = "nya"
+    try:
+        assert (
+            validate_verse_payload({"book": "Jn", "chapter": 3, "verse": 16})["lang"]
+            == "nya"
+        )
+        assert (
+            validate_verse_payload(
+                {"book": "Jn", "chapter": 3, "verse": 16, "lang": "klingon"}
+            )["lang"]
+            == "eng"
+        )
+    finally:
+        server_module.CURRENT_LANG = monkeypatch_lang
+
+
+def test_validate_verse_payload_rejects_malformed(client):
+    from server import validate_verse_payload
+
+    assert validate_verse_payload(None) is None
+    assert validate_verse_payload("John 3:16") is None
+    assert validate_verse_payload({}) is None
+    assert validate_verse_payload({"book": "", "chapter": 3, "verse": 16}) is None
+    assert validate_verse_payload({"book": 123, "chapter": 3, "verse": 16}) is None
+    assert validate_verse_payload({"book": "x" * 81, "chapter": 3, "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": "three", "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 0, "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 3, "verse": 177}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 151, "verse": 1}) is None
+
+
+def test_unauthorized_events_are_rejected(client, monkeypatch, tmp_path):
+    """Bad-key verse triggers and clears must not touch the DB or broadcast."""
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "auth.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text('{"John": {"3": {"16": "For God so loved..."}}}', encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+    monkeypatch.setenv(server_module.ENV_KEY_NAME, "s3cret")
+
+    emitted = []
+    monkeypatch.setattr(
+        server_module, "emit", lambda *a, **k: emitted.append((a, k))
+    )
+
+    server_module.handle_verse({"book": "John", "chapter": 3, "verse": 16})
+    server_module.handle_verse(
+        {"book": "John", "chapter": 3, "verse": 16, "key": "wrong"}
+    )
+    server_module.handle_clear_overlay({})
+    server_module.handle_set_language({"lang": "bem"})
+    assert emitted == []
+
+    # Correct key flows through to a broadcast.
+    server_module.handle_verse(
+        {"book": "John", "chapter": 3, "verse": 16, "key": "s3cret"}
+    )
+    assert any(a[0] == "update_overlay" for a, _ in emitted)
+    emitted.clear()
+
+    server_module.handle_set_language({"lang": "bem", "key": "s3cret"})
+    assert any(a[0] == "language_changed" for a, _ in emitted)
+    assert server_module.CURRENT_LANG == "bem"
+    emitted.clear()
+
+    server_module.handle_clear_overlay({"key": "s3cret"})
+    assert any(a[0] == "clear_overlay" for a, _ in emitted)
+
+
+def test_malformed_verse_payload_is_ignored_without_broadcast(
+    client, monkeypatch, tmp_path
+):
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "malformed.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text('{"John": {"3": {"16": "For God so loved..."}}}', encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+    monkeypatch.delenv(server_module.ENV_KEY_NAME, raising=False)
+
+    emitted = []
+    monkeypatch.setattr(
+        server_module, "emit", lambda *a, **k: emitted.append((a, k))
+    )
+
+    server_module.handle_verse({"chapter": 3, "verse": 16})  # no book
+    server_module.handle_verse(
+        {"book": "John", "chapter": "three", "verse": 16}  # non-numeric
+    )
+    server_module.handle_verse(
+        {"book": "John", "chapter": 999, "verse": 1}  # out of range
+    )
+    assert emitted == []
+
+
 def test_translation_labels_cover_hotkey_languages(client):
     from server import TRANSLATION_LABELS
 
     for code in client.HOTKEY_LANGS.values():
         assert code in TRANSLATION_LABELS
+
+
+# --------------------------------------------------------------------------
+# Server P0: shared-secret auth, payload validation, clear_overlay
+# --------------------------------------------------------------------------
+def test_auth_open_when_no_key_configured(client, monkeypatch):
+    import server as server_module
+
+    monkeypatch.delenv("DABARSTREAM_KEY", raising=False)
+    assert server_module.is_authorized({"lang": "bem"}) is True
+    assert server_module.is_authorized({}) is True  # open local dev mode
+
+
+def test_auth_enforced_when_key_configured(client, monkeypatch):
+    import server as server_module
+
+    monkeypatch.setenv("DABARSTREAM_KEY", "s3cret")
+    assert server_module.is_authorized({"lang": "bem", "key": "s3cret"}) is True
+    assert server_module.is_authorized({"lang": "bem", "key": "wrong"}) is False
+    assert server_module.is_authorized({"lang": "bem"}) is False
+    assert server_module.is_authorized(None) is False
+    assert server_module.is_authorized("not-a-dict") is False
+
+
+def test_validate_verse_payload_accepts_digit_form(client):
+    from server import validate_verse_payload
+
+    cleaned = validate_verse_payload(
+        {"book": "  John ", "chapter": "3", "verse": 16, "lang": "eng"}
+    )
+    assert cleaned == {"book": "John", "chapter": 3, "verse": 16, "lang": "eng"}
+
+
+def test_validate_verse_payload_rejects_invalid_and_defaults_lang(client):
+    """Out-of-range numbers are rejected; unknown language falls back to eng.
+
+    Named distinctly from the earlier malformed-payload test: duplicate
+    function names in a module cause pytest to collect only the last
+    definition, silently dropping coverage.
+    """
+    from server import validate_verse_payload
+
+    assert validate_verse_payload(None) is None
+    assert validate_verse_payload("John 3:16") is None
+    assert validate_verse_payload({}) is None
+    assert validate_verse_payload({"book": "", "chapter": 3, "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": "three", "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 0, "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 3, "verse": 999}) is None
+    # Unknown language falls back to eng rather than rejecting the verse
+    cleaned = validate_verse_payload(
+        {"book": "John", "chapter": "3", "verse": "16", "lang": "klingon"}
+    )
+    assert cleaned is not None and cleaned["lang"] == "eng"
+
+
+def test_clear_overlay_handler_emits_broadcast(client, monkeypatch):
+    import server as server_module
+
+    monkeypatch.delenv("DABARSTREAM_KEY", raising=False)
+    emitted = []
+    monkeypatch.setattr(
+        server_module, "emit", lambda event, payload, **kw: emitted.append((event, payload))
+    )
+    server_module.handle_clear_overlay({})
+    assert emitted == [("clear_overlay", {})]
+
+
+def test_clear_overlay_handler_rejects_bad_key(client, monkeypatch):
+    import server as server_module
+
+    monkeypatch.setenv("DABARSTREAM_KEY", "s3cret")
+    emitted = []
+    monkeypatch.setattr(
+        server_module, "emit", lambda event, payload, **kw: emitted.append((event, payload))
+    )
+    server_module.handle_clear_overlay({"key": "wrong"})
+    assert emitted == []
 
 
 def test_server_serves_requested_local_language(client, tmp_path):

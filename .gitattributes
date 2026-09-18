@@ -1,0 +1,5 @@
+# Keep bash/systemd files LF-only so deploys don't break on Oracle Linux.
+deploy_vps.sh text eol=lf
+dabarstream.service text eol=lf
+*.py text eol=crlf
+*.md text eol=crlf

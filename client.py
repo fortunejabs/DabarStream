@@ -4,6 +4,7 @@ Captures microphone audio, transcribes locally on CPU with faster-whisper
 (INT8), detects scripture references, and emits them to the cloud VPS.
 """
 
+import os
 import re
 
 import numpy as np
@@ -21,6 +22,10 @@ MODEL_SIZE = "base.en"   # 'tiny.en' or 'base.en' are best for low-resource CPU 
 COMPUTE_TYPE = "int8"    # Quantization reduces memory & CPU overhead
 AUDIO_BUFFER_LIMIT = 4   # Evaluate incoming audio every N seconds
 DEFAULT_LANG = "eng"     # Translation to display: 'eng', 'bem', 'nya', 'ton'...
+
+# Shared secret sent with every control emit; must match DABARSTREAM_KEY in
+# the server environment. Empty disables auth (local dev only).
+STREAM_KEY = os.environ.get("DABARSTREAM_KEY", "")
 
 # Voice-activated language switching: spoken phrases -> translation codes
 LANG_COMMANDS = {
@@ -63,6 +68,121 @@ verse_pattern = re.compile(
     re.IGNORECASE,
 )
 
+# Spoken number words Whisper emits instead of digits, e.g. "chapter three
+# verse sixteen". Hyphens/spaces are normalized before lookup so "twenty-one"
+# and "twenty one" both resolve.
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100, "hundred and": 100,
+}
+
+
+def words_to_number(text):
+    """Converts a spoken number phrase to an int (e.g. 'twenty one' -> 21).
+
+    Returns None when the phrase contains no recognizable number words.
+    """
+    if not isinstance(text, str):
+        return None
+    tokens = text.lower().replace("-", " ").split()
+    total = 0
+    current = 0
+    found = False
+    i = 0
+    while i < len(tokens):
+        two = " ".join(tokens[i:i + 2])
+        if two in NUMBER_WORDS:
+            value = NUMBER_WORDS[two]
+            found = True
+            if value == 100:
+                current = max(current, 1) * 100
+            else:
+                current += value
+            i += 2
+            continue
+        word = tokens[i]
+        if word in NUMBER_WORDS:
+            found = True
+            value = NUMBER_WORDS[word]
+            if value == 100:
+                current = max(current, 1) * 100
+            else:
+                current += value
+        elif word == "and":
+            pass  # filler inside "hundred and X"; ignored unless nothing found
+        else:
+            return None  # non-number word breaks the phrase
+        i += 1
+    if not found:
+        return None
+    return total + current
+
+
+word_verse_pattern = re.compile(
+    r"\b([A-Za-z-\s]+?)(?:\s+chapter)?\s+([a-z][a-z\s-]*?)(?:\s*:\s*|\s+verse\s+|\s+chapter\s+|\s+)([a-z][a-z\s-]*)",
+    re.IGNORECASE,
+)
+
+
+def parse_verse_reference(text):
+    """Parses 'John 3:16' or 'John chapter three verse sixteen' -> (book, ch, vs).
+
+    Returns (book, chapter, verse) as (str, str, str) or None when no
+    reference is detected. Digit form is tried first; spoken number words
+    are the fallback. Number words are collected into maximal runs, with
+    'chapter'/'verse'/':' acting as separators, so compound spoken numbers
+    ("twenty three", "one hundred and fifty") resolve correctly.
+    """
+    digit_match = verse_pattern.search(text)
+    if digit_match:
+        return digit_match.groups()
+
+    tokens = text.split()
+
+    # Book = everything before the first number word.
+    book_end = None
+    for idx, tok in enumerate(tokens):
+        stripped = tok.lower().strip("-.:")
+        if stripped in NUMBER_WORDS:
+            book_end = idx
+            break
+    if book_end is None or book_end == 0:
+        return None
+    book_tokens = tokens[:book_end]
+    # Drop trailing separator words that sit between book and numbers
+    # ("John chapter three..." -> book "john", not "john chapter").
+    while book_tokens and book_tokens[-1].lower().strip("-.:,") in ("chapter", "verse"):
+        book_tokens.pop()
+    book = " ".join(book_tokens)
+    if not re.search(r"[A-Za-z]", book):
+        return None
+
+    # Split the remainder into maximal runs of number words.
+    runs = []
+    current = []
+    for tok in tokens[book_end:]:
+        w = tok.lower().replace("-", "").strip(".,:;")
+        if w in NUMBER_WORDS or w == "and":
+            current.append(w)
+        elif current:
+            runs.append(" ".join(current))
+            current = []
+    if current:
+        runs.append(" ".join(current))
+
+    if len(runs) < 2:
+        return None
+    chapter = words_to_number(runs[0])
+    verse = words_to_number(runs[-1])
+    if chapter and verse:
+        return book, str(chapter), str(verse)
+    return None
+
 
 def detect_language_command(text):
     """
@@ -85,7 +205,7 @@ def switch_language(lang_code):
     global ACTIVE_LANG
     ACTIVE_LANG = lang_code
     try:
-        sio.emit("set_language", {"lang": lang_code})
+        sio.emit("set_language", {"lang": lang_code, "key": STREAM_KEY})
     except Exception as e:
         print(f"Language switch could not reach VPS yet: {e}")
     return lang_code
@@ -114,9 +234,9 @@ def process_audio(audio_bytes, model, active_lang=None):
                 active_lang = lang_code
                 continue
 
-            match = verse_pattern.search(text)
+            match = parse_verse_reference(text)
             if match:
-                book, chapter, verse = match.groups()
+                book, chapter, verse = match
                 book_cleaned = " ".join(book.split())
                 print(f"Trigger Detected -> {book_cleaned} {chapter}:{verse} [{active_lang}]")
                 sio.emit(
@@ -126,6 +246,7 @@ def process_audio(audio_bytes, model, active_lang=None):
                         "chapter": chapter,
                         "verse": verse,
                         "lang": active_lang,
+                        "key": STREAM_KEY,
                     },
                 )
     return active_lang

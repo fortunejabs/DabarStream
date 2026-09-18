@@ -133,6 +133,41 @@ def test_server_resolver_aliases():
     assert resolve_book("Genesis") == "genesis"
 
 
+def test_validate_verse_payload_accepts_digit_form():
+    from server import validate_verse_payload
+
+    assert validate_verse_payload(
+        {"book": "  John ", "chapter": "3", "verse": 16, "lang": "eng"}
+    ) == {"book": "John", "chapter": 3, "verse": 16, "lang": "eng"}
+
+
+def test_validate_verse_payload_rejects_malformed():
+    from server import validate_verse_payload
+
+    assert validate_verse_payload(None) is None
+    assert validate_verse_payload({"chapter": 3, "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": "x", "verse": 16}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 3, "verse": 0}) is None
+    assert validate_verse_payload({"book": "John", "chapter": 151, "verse": 1}) is None
+    assert validate_verse_payload({"book": "x" * 81, "chapter": 3, "verse": 16}) is None
+
+
+def test_is_authorized_matches_configured_key(monkeypatch):
+    import server
+
+    monkeypatch.setenv(server.ENV_KEY_NAME, "secret123")
+    assert server.is_authorized({"key": "secret123"}) is True
+    assert server.is_authorized({"key": "wrong"}) is False
+    assert server.is_authorized({}) is False
+
+
+def test_is_authorized_open_when_no_key_configured(monkeypatch):
+    import server
+
+    monkeypatch.delenv(server.ENV_KEY_NAME, raising=False)
+    assert server.is_authorized({}) is True
+
+
 def test_server_resolver_query(tmp_path):
     """Validates end-to-end resolver + database lookup."""
     test_file = tmp_path / "mock_freeshow.json"

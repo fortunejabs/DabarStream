@@ -38,17 +38,38 @@ Three ways to change the active translation during a service:
 2. **Hotkeys** - optional, requires `pip install pynput`:
    `1`=English `2`=Bemba `3`=Nyanja `4`=Tonga (edit `HOTKEY_LANGS` to remap).
 3. **Control panel** - open `http://193.123.179.93:5000/control` in a browser for
-   clickable language buttons plus a manual book/chapter/verse sender.
+   clickable language buttons plus a manual book/chapter/verse sender and a
+   **Clear Overlay** button (also wired in the overlay page itself).
+
+## Stream key (required before going live)
+
+All Socket.IO control events (`verse_triggered`, `set_language`, `clear_overlay`)
+must carry the shared secret. Set it on both sides:
+
+```powershell
+# Streaming PC (client) — PowerShell
+$env:DABARSTREAM_KEY = "pick-a-long-random-secret"
+```
+
+```bash
+# VPS (server) — add to the systemd unit or export before launch
+Environment=DABARSTREAM_KEY=pick-a-long-random-secret
+```
+
+Without the key the server only accepts local-dev traffic. Type the same key into
+the password field on `/control`. Malformed verse payloads (missing book,
+non-numeric or out-of-range chapter/verse) are rejected and logged.
 
 A spoken switch applies to every verse trigger that follows it until you switch
 again, and each overlay shows a short banner announcing the new translation.
 
 ## Quick Start (local dev)
 ```powershell
-py -3 -m venv .venv
+# PowerShell 5.1+ / PowerShell 7
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pytest             # run validation suite (24 tests)
+pytest             # run validation suite
 python importer.py # after uncommenting an import call, to build bible.db
 python server.py   # run locally for testing
 python client.py   # run on streaming machine (requires mic)

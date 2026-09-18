@@ -5,10 +5,14 @@ Windows capture client, resolves book aliases, queries SQLite, and
 broadcasts scripture to OBS browser-source overlays.
 """
 
+import hmac
+import os
 import re
 import sqlite3
+import json
+import time
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
@@ -70,6 +74,121 @@ TRANSLATION_LABELS = {
 # Currently active translation (voice/hotkey/panel switchable)
 CURRENT_LANG = "eng"
 
+# Shared secret protecting the Socket.IO control events. Set DABARSTREAM_KEY
+# in the environment on BOTH the VPS (server) and the streaming PC (client,
+# control-panel key field). When unset, auth is disabled (local dev only) --
+# never expose an unauthenticated server to the internet.
+ENV_KEY_NAME = "DABARSTREAM_KEY"
+
+
+def _required_key() -> str:
+    return os.environ.get(ENV_KEY_NAME, "")
+
+
+def is_authorized(data) -> bool:
+    """True when the payload carries the configured stream key (or none is set)."""
+    required = _required_key()
+    if not required:
+        return True
+    if not isinstance(data, dict):
+        return False
+    provided = data.get("key", "")
+    return hmac.compare_digest(str(provided), required)
+
+
+def validate_verse_payload(data):
+    """Validates an incoming verse trigger.
+
+    Returns {"book", "chapter", "verse", "lang"} with chapter/verse coerced
+    to ranged ints, or None when the payload is malformed and must be ignored.
+    """
+    if not isinstance(data, dict):
+        return None
+    book = data.get("book", "")
+    if not isinstance(book, str):
+        return None
+    book = " ".join(book.split())
+    if not book or len(book) > 80:
+        return None
+    try:
+        chapter = int(str(data.get("chapter", "")).strip())
+        verse = int(str(data.get("verse", "")).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not 1 <= chapter <= 150 or not 1 <= verse <= 176:
+        return None
+    lang = normalize_lang(data.get("lang") or CURRENT_LANG) or "eng"
+    return {"book": book, "chapter": chapter, "verse": verse, "lang": lang}
+
+
+# Whitelisted style keys for slide themes (Phase 1: named presets on overlay side)
+_THEME_KEYS = {"bg", "color", "align", "font"}
+
+
+def validate_slide_payload(data):
+    """Validates a generic slide payload (Projects/Slides feature seed).
+
+    Returns {"title", "lines", "theme"} or None when malformed. `lines` is a
+    list of at most 20 strings of at most 500 chars each; `theme` (optional)
+    is a dict whose keys are limited to bg/color/align/font with short values.
+    """
+    if not isinstance(data, dict):
+        return None
+    title = data.get("title", "")
+    if not isinstance(title, str):
+        return None
+    title = " ".join(title.split())
+    if not title or len(title) > 120:
+        return None
+    lines = data.get("lines")
+    if not isinstance(lines, list) or not 1 <= len(lines) <= 20:
+        return None
+    cleaned_lines = []
+    for line in lines:
+        if not isinstance(line, str):
+            return None
+        line = " ".join(line.split())
+        if not line or len(line) > 100:
+            return None
+        cleaned_lines.append(line)
+    theme = data.get("theme")
+    cleaned_theme = {}
+    if theme is not None:
+        if not isinstance(theme, dict):
+            return None
+        for key, value in theme.items():
+            if key not in _THEME_KEYS or not isinstance(value, str) or len(value) > 40:
+                return None
+            cleaned_theme[key] = value
+    return {"title": title, "lines": cleaned_lines, "theme": cleaned_theme}
+
+
+def validate_timer_payload(data):
+    """Validates a timer control payload.
+
+    Returns {"action", "label", "ends_at"} where ends_at is an epoch timestamp
+    (only for 'start') or None when malformed.
+    """
+    if not isinstance(data, dict):
+        return None
+    action = data.get("action")
+    if action not in ("start", "stop", "clear"):
+        return None
+    label = data.get("label", "")
+    if not isinstance(label, str) or len(label) > 60:
+        return None
+    label = " ".join(label.split())
+    ends_at = None
+    if action == "start":
+        try:
+            minutes = float(data.get("minutes", 0))
+        except (TypeError, ValueError):
+            return None
+        if not 0.1 <= minutes <= 1440:
+            return None
+        ends_at = round(time.time() + minutes * 60, 1)
+    return {"action": action, "label": label, "ends_at": ends_at}
+
 OVERLAY_HTML = """
 <!DOCTYPE html>
 <html>
@@ -113,6 +232,10 @@ OVERLAY_HTML = """
             clearTimeout(hideTimeout);
             hideTimeout = setTimeout(() => { box.style.opacity = "0"; }, 3000);
         });
+        socket.on('clear_overlay', function() {
+            clearTimeout(hideTimeout);
+            box.style.opacity = "0";
+        });
         socket.on('update_overlay', function(data) {
             clearTimeout(hideTimeout);
             refElement.innerText = data.book + " " + data.chapter + ":" + data.verse;
@@ -154,7 +277,8 @@ def resolve_book(raw_book: str) -> str:
 
 
 def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "eng",
-                            db_path: str = DB_PATH):
+                            db_path: str = None):
+    db_path = db_path or DB_PATH
     """
     Parses verbal shortcuts (in any supported language) and queries the
     database for the requested translation. Falls back to the English
@@ -214,10 +338,14 @@ CONTROL_HTML = """
         form { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
         input { width: 80px; }
         input.book { width: 160px; }
+        input.key { width: 200px; }
+        .danger { margin-top: 10px; }
     </style>
 </head>
 <body>
     <h1>DabarStream Control Panel</h1>
+    <div class="row"><input class="key" id="stream-key" type="password"
+        placeholder="Stream key (DABARSTREAM_KEY)"></div>
     <div class="row" id="lang-buttons"></div>
     <form id="verse-form">
         <input class="book" id="book" placeholder="Book (e.g. Yohane)">
@@ -225,6 +353,7 @@ CONTROL_HTML = """
         <input id="verse" type="number" min="1" placeholder="Vs">
         <button type="submit">Send Verse</button>
     </form>
+    <div class="row danger"><button id="clear-btn">Clear Overlay</button></div>
     <div id="status"></div>
     <script>
         const socket = io();
@@ -233,12 +362,14 @@ CONTROL_HTML = """
         const status = document.getElementById('status');
         let currentLang = 'eng';
 
+        function streamKey() { return document.getElementById('stream-key').value; }
+
         labels.forEach(item => {
             const [code, label] = item.split('|');
             const btn = document.createElement('button');
             btn.textContent = label;
             btn.dataset.lang = code;
-            btn.onclick = () => socket.emit('set_language', {lang: code});
+            btn.onclick = () => socket.emit('set_language', {lang: code, key: streamKey()});
             box.appendChild(btn);
         });
 
@@ -257,9 +388,57 @@ CONTROL_HTML = """
                 book: document.getElementById('book').value,
                 chapter: document.getElementById('chapter').value,
                 verse: document.getElementById('verse').value,
+                key: streamKey(),
             });
             status.innerText = 'Verse sent.';
         };
+
+        document.getElementById('clear-btn').onclick = () => {
+            socket.emit('clear_overlay', {key: streamKey()});
+            status.innerText = 'Overlay cleared.';
+        };
+
+        // Phase 1: slide + timer controls. Null-guarded so this script keeps
+        // working even before the matching HTML inputs/buttons are added.
+        const slideBtn = document.getElementById('slide-btn');
+        if (slideBtn) slideBtn.onclick = () => {
+            const title = document.getElementById('slide-title').value.trim();
+            const lines = document.getElementById('slide-lines').value
+                .split('\n').map(s => s.trim()).filter(Boolean);
+            if (!title || !lines.length) {
+                status.innerText = 'Slide needs a title and at least one line.';
+                return;
+            }
+            socket.emit('show_slide', {title: title, lines: lines, key: streamKey()});
+            status.innerText = 'Slide sent.';
+        };
+
+        const timerStart = document.getElementById('timer-start');
+        if (timerStart) timerStart.onclick = () => {
+            const minutes = parseFloat(document.getElementById('timer-minutes').value);
+            const label = document.getElementById('timer-label').value.trim();
+            if (!minutes || minutes <= 0) {
+                status.innerText = 'Timer needs minutes greater than 0.';
+                return;
+            }
+            socket.emit('timer_control', {action: 'start', minutes: minutes, label: label, key: streamKey()});
+            status.innerText = 'Timer started.';
+        };
+        const timerStop = document.getElementById('timer-stop');
+        if (timerStop) timerStop.onclick = () => {
+            socket.emit('timer_control', {
+                action: 'stop',
+                label: (document.getElementById('timer-label') || {}).value || '',
+                key: streamKey()
+            });
+            status.innerText = 'Timer stopped.';
+        };
+        const timerClear = document.getElementById('timer-clear');
+        if (timerClear) timerClear.onclick = () => {
+            socket.emit('timer_control', {action: 'clear', key: streamKey()});
+            status.innerText = 'Timer cleared.';
+        };
+
         refresh();
     </script>
 </body>
@@ -272,10 +451,175 @@ def control_panel():
     return render_template_string(CONTROL_HTML)
 
 
+# Stage display: a text-only confidence monitor for people on stage.
+# Shows the current verse/slide/timer without styling or transparency tricks.
+STAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DabarStream - Stage Display</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { margin: 0; background: #111; color: #fff; font-family: 'Segoe UI', sans-serif;
+               display: flex; flex-direction: column; align-items: center; padding: 24px; }
+        #clock { font-size: 28px; color: #9ad; }
+        #label { font-size: 34px; font-weight: bold; color: #ffcc00; margin: 16px 0 8px; }
+        #body { font-size: 40px; line-height: 1.5; text-align: center; max-width: 90%; }
+        #timer { font-size: 56px; color: #7f7; margin-top: 24px; }
+    </style>
+</head>
+<body>
+    <div id="clock">--:--</div>
+    <div id="label">DabarStream Stage</div>
+    <div id="body">Waiting for the current item...</div>
+    <div id="timer"></div>
+    <script>
+        const socket = io();
+        const label = document.getElementById('label');
+        const body = document.getElementById('body');
+        const timer = document.getElementById('timer');
+        let endsAt = null, timerLabel = '', timerTick = null;
+
+        function show(title, lines) {
+            label.innerText = title;
+            body.innerHTML = '';
+            for (const line of lines) {
+                const p = document.createElement('div');
+                p.innerText = line;
+                body.appendChild(p);
+            }
+            timer.innerText = '';
+            endsAt = null;
+        }
+
+        function clockTick() {
+            const now = new Date();
+            document.getElementById('clock').innerText =
+                now.getHours().toString().padStart(2, '0') + ':' +
+                now.getMinutes().toString().padStart(2, '0') + ':' +
+                now.getSeconds().toString().padStart(2, '0');
+        }
+        setInterval(clockTick, 1000); clockTick();
+
+        socket.on('update_overlay', (d) => {
+            show(d.book + ' ' + d.chapter + ':' + d.verse + (d.lang_label ? ' [' + d.lang_label + ']' : ''),
+                 [d.text].concat(d.text_eng ? ['— ' + d.text_eng] : []));
+        });
+        socket.on('update_slide', (d) => show(d.title, d.lines));
+        socket.on('clear_overlay', () => {
+            label.innerText = 'DabarStream Stage';
+            body.innerText = '';
+            timer.innerText = '';
+            endsAt = null;
+        });
+        socket.on('language_changed', () => {}); // stage shows content only
+
+        socket.on('timer_update', (d) => {
+            if (d.action === 'start') {
+                endsAt = d.ends_at; timerLabel = d.label || 'Timer';
+                clearInterval(timerTick);
+                timerTick = setInterval(() => {
+                    const left = Math.max(0, Math.round(endsAt - Date.now() / 1000));
+                    const m = Math.floor(left / 60), s = left % 60;
+                    timer.innerText = timerLabel + ': ' + m + ':' + s.toString().padStart(2, '0');
+                    if (left <= 0) { clearInterval(timerTick); timerLabel = ''; }
+                }, 500);
+            } else if (d.action === 'stop') {
+                endsAt = null; clearInterval(timerTick); timer.innerText = (d.label || '') + ' stopped';
+            } else {
+                endsAt = null; clearInterval(timerTick); timer.innerText = '';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/stage")
+def stage_display():
+    return render_template_string(STAGE_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (foundation) — Projects: named, git-friendly JSON slide collections.
+# A project is any JSON object the client wants to persist (e.g. a list of
+# saved slides). IDs are sanitized to safe filenames; writes require the
+# shared key, reads are open in local-dev mode.
+# ---------------------------------------------------------------------------
+PROJECTS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.getenv("DABARSTREAM_PROJECTS", "projects"),
+)
+os.makedirs(PROJECTS_DIR, exist_ok=True)
+
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9 _.-]{1,64}$")
+
+
+def _project_path(project_id):
+    safe = (project_id or "").strip()
+    if not _PROJECT_ID_RE.match(safe):
+        return None
+    fname = safe.replace("/", "_").replace("\\", "_").replace(" ", "_") + ".json"
+    return os.path.join(PROJECTS_DIR, fname)
+
+
+def save_project(project_id, payload):
+    path = _project_path(project_id)
+    if not path or not isinstance(payload, (dict, list)):
+        return None
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_project(project_id):
+    path = _project_path(project_id)
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def list_projects():
+    out = []
+    for name in os.listdir(PROJECTS_DIR):
+        if name.endswith(".json"):
+            base = name[:-5].replace("_", " ")
+            out.append({"id": base, "url": "/api/projects/" + base})
+    return sorted(out, key=lambda x: x["id"])
+
+
+@app.route("/api/projects")
+def api_list_projects():
+    return jsonify(list_projects())
+
+
+@app.route("/api/projects/<project_id>", methods=["GET"])
+def api_get_project(project_id):
+    data = load_project(project_id)
+    if data is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(data)
+
+
+@app.route("/api/projects/<project_id>", methods=["POST"])
+def api_save_project(project_id):
+    if not is_authorized(request.args.to_dict(flat=True)):
+        return jsonify({"error": "forbidden"}), 403
+    path = save_project(project_id, request.get_json(silent=True))
+    if path is None:
+        return jsonify({"error": "invalid project id or payload"}), 400
+    return jsonify({"saved": True, "id": project_id}), 201
+
+
 @socketio.on("set_language")
 def handle_set_language(data):
     """Voice/hotkey/panel language switch. Broadcasts the new state to all overlays."""
     global CURRENT_LANG
+    if not is_authorized(data):
+        print("[Auth]: Rejected set_language (bad or missing stream key)")
+        return
     lang = normalize_lang((data or {}).get("lang"))
     if lang:
         CURRENT_LANG = lang
@@ -291,16 +635,27 @@ def handle_set_language(data):
 
 @socketio.on("verse_triggered")
 def handle_verse(data):
-    lang = data.get("lang") or CURRENT_LANG
+    if not is_authorized(data):
+        print("[Auth]: Rejected verse_triggered (bad or missing stream key)")
+        return
+    cleaned = validate_verse_payload(data)
+    if cleaned is None:
+        print(f"[Validation]: Ignored malformed verse payload: {data!r}")
+        return
+    lang = cleaned["lang"]
     print(
         f"[Cloud Event Received]: Querying database for "
-        f"{data['book']} {data['chapter']}:{data['verse']} [{lang}]"
+        f"{cleaned['book']} {cleaned['chapter']}:{cleaned['verse']} [{lang}]"
     )
-    scripture = resolve_and_query_bible(data["book"], data["chapter"], data["verse"], lang)
+    scripture = resolve_and_query_bible(
+        cleaned["book"], cleaned["chapter"], cleaned["verse"], lang
+    )
 
     if not scripture:
         # Last-resort fallback to English coordinates
-        scripture = resolve_and_query_bible(data["book"], data["chapter"], data["verse"], "eng")
+        scripture = resolve_and_query_bible(
+            cleaned["book"], cleaned["chapter"], cleaned["verse"], "eng"
+        )
         if scripture:
             lang = "eng"
 
@@ -320,12 +675,56 @@ def handle_verse(data):
         # Dual-language mode: also fetch the English text when the
         # requested translation is a local language, for side-by-side display.
         if lang != "eng":
-            english = resolve_and_query_bible(data["book"], data["chapter"], data["verse"], "eng")
+            english = resolve_and_query_bible(
+                cleaned["book"], cleaned["chapter"], cleaned["verse"], "eng"
+            )
             if english:
                 payload["text_eng"] = english[3]
                 payload["book_eng"] = english[0]
 
         emit("update_overlay", payload, broadcast=True)
+
+
+@socketio.on("clear_overlay")
+def handle_clear_overlay(data):
+    """Manual clear: immediately hides the overlay on every connected client."""
+    if not is_authorized(data):
+        print("[Auth]: Rejected clear_overlay (bad or missing stream key)")
+        return
+    print("[Overlay]: Clearing overlay on all clients")
+    emit("clear_overlay", {}, broadcast=True)
+
+
+@socketio.on("show_slide")
+def handle_show_slide(data):
+    """Phase 1 Projects/Slides seed: push a generic text slide to all outputs."""
+    if not is_authorized(data):
+        print("[Auth]: Rejected show_slide (bad or missing stream key)")
+        return
+    cleaned = validate_slide_payload(data)
+    if cleaned is None:
+        print(f"[Validation]: Ignored malformed slide payload: {data!r}")
+        return
+    print(f"[Slide]: Broadcasting '{cleaned['title']}' ({len(cleaned['lines'])} lines)")
+    emit(
+        "update_slide",
+        {"title": cleaned["title"], "lines": cleaned["lines"], "theme": cleaned["theme"]},
+        broadcast=True,
+    )
+
+
+@socketio.on("timer_control")
+def handle_timer_control(data):
+    """Phase 1 Timers: start/stop/clear a countdown on stage + overlays."""
+    if not is_authorized(data):
+        print("[Auth]: Rejected timer_control (bad or missing stream key)")
+        return
+    cleaned = validate_timer_payload(data)
+    if cleaned is None:
+        print(f"[Validation]: Ignored malformed timer payload: {data!r}")
+        return
+    print(f"[Timer]: {cleaned['action']} (label={cleaned['label']!r})")
+    emit("timer_update", cleaned, broadcast=True)
 
 
 if __name__ == "__main__":
