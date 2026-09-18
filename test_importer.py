@@ -247,3 +247,147 @@ def test_server_language_fallback(tmp_path):
     result_eng = resolve_and_query_bible("Jn", 3, 16, translation_code="eng", db_path=DB_PATH)
     assert result_eng is not None
     assert result_eng[0] == "John"
+
+
+# ---------------------------------------------------------------------------
+# import_bibles.py bulk-loader parsers (regression tests)
+#
+# Real-world XML quirks these lock down:
+#   * Zefania <BIBLEBOOK bnumber="1"> with NO bname (King James 2000)
+#   * Zefania bname carrying a LOCALISED name (ISV ships German "Matthäus")
+#   * <VERS> instead of <VERSE> (Zefania standard)
+#   * inline <STYLE css=...> markup inside a verse (KJ2000 red-letter text)
+# ---------------------------------------------------------------------------
+def _parse(xml, parser_name):
+    """Run one import_bibles parser over an XML string and return its rows."""
+    import xml.etree.ElementTree as ET
+
+    import import_bibles
+
+    root = ET.fromstring(xml)
+    parser = getattr(import_bibles, parser_name)
+    return list(parser(root))
+
+
+def test_import_bibles_is_safe_to_import():
+    """Importing the bulk loader must not sys.exit() when Bibles/ is absent."""
+    import import_bibles
+
+    # No database/file side effects at import time; the list is still defined.
+    assert isinstance(import_bibles.IMPORTS, list)
+    assert len(import_bibles.IMPORTS) > 0
+    assert callable(import_bibles.missing_files)
+
+
+def test_zefania_book_without_bname_falls_back_to_canonical():
+    """KJ2000-style files omit bname: book number drives the canonical name."""
+    xml = (
+        '<XMLBIBLE><BIBLEBOOK bnumber="1"><CHAPTER cnumber="1">'
+        '<VERS vnumber="1">In the beginning God created the heaven and the earth.</VERS>'
+        "</CHAPTER></BIBLEBOOK></XMLBIBLE>"
+    )
+    rows = _parse(xml, "parse_zefania")
+
+    assert len(rows) == 1
+    book, chapter, verse, text = rows[0]
+    assert book == "Genesis"          # was a crash: None.split()
+    assert (chapter, verse) == (1, 1)
+    assert "In the beginning" in text
+
+
+def test_zefania_localised_bname_is_overridden_by_canonical_name():
+    """ISV ships German book names; the shared key must stay English."""
+    xml = (
+        '<XMLBIBLE><BIBLEBOOK bnumber="40" bname="Matth\u00e4us" bsname="Mt">'
+        '<CHAPTER cnumber="1">'
+        '<VERS vnumber="1">This is a record of the birth of Jesus Christ.</VERS>'
+        "</CHAPTER></BIBLEBOOK></XMLBIBLE>"
+    )
+    rows = _parse(xml, "parse_zefania")
+
+    assert len(rows) == 1
+    assert rows[0][0] == "Matthew"     # not "Matthäus"
+
+
+def test_zefania_keeps_inline_markup_text():
+    """Red-letter <STYLE> runs must not truncate the verse to 'And God said, '."""
+    xml = (
+        '<XMLBIBLE><BIBLEBOOK bnumber="1"><CHAPTER cnumber="1">'
+        '<VERS vnumber="3">And God said, '
+        '<STYLE css="color:#FF0000">Let there be light:</STYLE> and there was light.'
+        "</VERS></CHAPTER></BIBLEBOOK></XMLBIBLE>"
+    )
+    rows = _parse(xml, "parse_zefania")
+
+    text = rows[0][3]
+    assert "Let there be light:" in text
+    assert "and there was light." in text
+
+
+def test_zefania_skips_junk_rows_instead_of_raising():
+    """Non-numeric or missing numbers must be skipped, not crash the import."""
+    xml = (
+        '<XMLBIBLE><BIBLEBOOK bnumber="1"><CHAPTER cnumber="1">'
+        '<VERS vnumber="1">Good row.</VERS>'
+        "<VERS>No number here.</VERS>"
+        "</CHAPTER>"
+        '<CHAPTER cnumber="x"><VERS vnumber="1">Bad chapter.</VERS></CHAPTER>'
+        "</BIBLEBOOK></XMLBIBLE>"
+    )
+    rows = _parse(xml, "parse_zefania")
+
+    assert len(rows) == 1
+    assert rows[0][3] == "Good row."
+
+
+def test_holy_xml_format_uses_canonical_names_and_itertext():
+    """The Zambian collection: numbers only, plus inline markup support."""
+    xml = (
+        '<bible><testament name="Old">'
+        '<book number="19"><chapter number="23">'
+        '<verse number="1">The LORD is my shepherd; I shall not want.</verse>'
+        "</chapter></book></testament></bible>"
+    )
+    rows = _parse(xml, "parse_holy_xml_format")
+
+    assert len(rows) == 1
+    assert rows[0] == ("Psalms", 23, 1, "The LORD is my shepherd; I shall not want.")
+
+
+def test_holy_xml_format_rejects_out_of_range_book_number():
+    xml = (
+        '<bible><book number="99"><chapter number="1">'
+        '<verse number="1">Should be ignored.</verse>'
+        "</chapter></book></bible>"
+    )
+    assert _parse(xml, "parse_holy_xml_format") == []
+
+
+def test_opensong_parser_reads_nested_verse_text():
+    xml = (
+        '<song><b n="John"><c n="3">'
+        '<v n="16">For God so loved <i>the world</i>, that he gave...</v>'
+        "</c></b></song>"
+    )
+    rows = _parse(xml, "parse_opensong")
+
+    assert len(rows) == 1
+    book, chapter, verse, text = rows[0]
+    assert (book, chapter, verse) == ("John", 3, 16)
+    assert "For God so loved the world, that he gave..." in text
+
+
+def test_detect_parser_recognises_all_three_schemas():
+    import xml.etree.ElementTree as ET
+
+    import import_bibles
+
+    holy = ET.fromstring('<bible><book number="1"/></bible>')
+    zef = ET.fromstring('<XMLBIBLE><BIBLEBOOK bnumber="1"/></XMLBIBLE>')
+    osg = ET.fromstring('<song><b n="John"/></song>')
+    other = ET.fromstring("<root><thing/></root>")
+
+    assert import_bibles.detect_parser(holy) is import_bibles.parse_holy_xml_format
+    assert import_bibles.detect_parser(zef) is import_bibles.parse_zefania
+    assert import_bibles.detect_parser(osg) is import_bibles.parse_opensong
+    assert import_bibles.detect_parser(other) is None

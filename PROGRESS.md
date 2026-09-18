@@ -1,5 +1,56 @@
 # DabarStream Progress Monitor
 
+## [2026-09-18 BULK BIBLE IMPORT: 33 translations, 30 imported / 3 pending]
+- `import_bibles.py` bulk-loads every XML under
+  `Bibles/Holy-Bible-XML-Format-master/` into `bible.db`, keyed by
+  `translation_code`, with a resumable manifest
+  (`Bibles/_import_manifest.json`, git-ignored) so re-runs skip finished files.
+- **Imported so far (30 files, ~900k rows):** 6 Zambian files (`bem`, `nya`,
+  `bem_chibemba`, `nya_1992`, `nya_2014`, `nya_blydc`) + 24 English (`eng` KJV,
+  `eng_asv`, `eng_darby`, `eng_ylt`, `eng_tyndale`, `eng_amp`, `eng_ampc`,
+  `eng_niv`, `eng_esv`, `eng_nlt`, `eng_nkjv`, `eng_nasb`, `eng_csb`, `eng_mev`,
+  `eng_lsb`, `eng_gw`, `eng_net`, `eng_msg`, `eng_gnb`, `eng_hcsb`, `eng_nivuk`,
+  `eng_rnkjv`, `eng_bbe`, `eng_akjv`).
+- **Still pending (3):** `eng_kj2000`, `eng_bwe`, `eng_isv` — they were blocked
+  by the parser bugs below, now fixed, so the next `import_bibles.py` run
+  completes them.
+- **Four parser bugs found and fixed** (each has a regression test in
+  `test_importer.py`: +9 tests, suite **58 -> 67**):
+  1. **`<VERS>` vs `<VERSE>`** — the "other Bibles" files use Zefania's `VERS`
+     tag; the parser only matched `VERSE`, so they imported **0 verses**. This is
+     why an earlier run printed "(0)" for many codes.
+  2. **`<BIBLEBOOK bnumber="1">` with NO `bname`** (King James 2000) made
+     `bname` `None` -> `AttributeError: 'NoneType' object has no attribute
+     'split'`, which aborted the entire run mid-list. The canonical English name
+     is now derived from the book number.
+  3. **Localised `bname` leaked into the shared key** — ISV literally ships
+     German (`bname="Matthäus"`), which would have poisoned the
+     `book_normalized` column. Book names are now *always* the canonical English
+     66; local-language names are matched via `importer.BOOK_LOCAL_TO_ENGLISH`
+     and `server.BOOK_ALIASES` instead.
+  4. **Inline markup truncated verses** — KJ2000 wraps red-letter text in
+     `<STYLE css=...>`, and `v.text` stops at the first child element, so
+     *"And God said, Let there be light: and there was light."* was stored as
+     just *"And God said, "* (a real data-loss bug, not just cosmetics). All
+     three parsers now use `itertext()`.
+- **`import_file()` is now fault-isolated:** one bad file prints
+  `ERROR importing ...` and the run **continues** to the remaining translations;
+  a file that parses 0 verses is reported and deliberately **not** recorded in
+  the manifest so a re-run retries it; junk rows/chapters are skipped instead of
+  raising (`_int()` None-safe coercion).
+- **`sys.exit(1)` on missing Bible files moved out of module scope into
+  `main()`** (`missing_files()`), so `import_bibles.py` is importable — and
+  therefore unit-testable — on a machine without the `Bibles/` tree.
+- Known data note: `nya_blydc` (Chewa BLYDC) contains only **64 books** at
+  source (Esther/Daniel/Joel/Nehemiah region absent). English fallback covers
+  the gaps; flagged here for the translation inventory.
+
+### Next command (user side)
+```powershell
+.venv\Scripts\python.exe import_bibles.py      # finishes KJ2000, BWE, ISV
+.venv\Scripts\python.exe -m pytest test_importer.py test_language.py test_slides.py   # expect 67
+```
+
 ## [2026-09-18 SUITE GREEN: 58/58 passed]
 - Full suite verified by the user in their terminal (Python 3.12.8, pytest 9.1.1):
   test_importer.py (14) + test_language.py (32) + test_slides.py (12) = **58 passed**.
@@ -104,17 +155,29 @@ this log. (The stale `.venv/pyvenv.cfg` was resolved when the venv was recreated
   (1=eng 2=bem 3=nya 4=ton), and the `/control` panel.
 
 ## Known stale docs
-- `README.md` still states "24 tests" — update after the next `pytest` run gives the real count.
+- `README.md` now says "67 tests" (58 + the 9 new `import_bibles.py` parser
+  tests) and documents the bulk import. If the next `pytest` run returns a
+  different count, correct it there and in the bulk-import section above.
 
 ## Pending (user side)
-1. Run `pytest` and report the count; update `README.md` if it differs from 24.
-2. Import a real Bible translation into `bible.db` (uncomment a call in `importer.py`).
-3. Extend `BOOK_LOCAL_TO_ENGLISH` / `BOOK_ALIASES` to full 66-book maps per language.
-4. Switch `MODEL_SIZE` to the multilingual `small` model for spoken Bemba/Nyanja/Tonga.
+1. Run `import_bibles.py` once more to finish `eng_kj2000` / `eng_bwe` /
+   `eng_isv`, then run `pytest` and confirm **67 passed**.
+2. Bulk translation import is now done via `import_bibles.py` (33 translations).
+   `importer.py`'s single-file helpers remain for one-off/FreeShow/EasyWorship
+   imports.
+3. Extend `BOOK_LOCAL_TO_ENGLISH` / `BOOK_ALIASES` to full 66-book maps per
+   language. **The Zambian XMLs carry no book names at all**, so Chewa/Bemba
+   spoken references (e.g. "Yohane", "Chiyambi", "Machitidwe") need alias
+   entries before voice triggering works in those languages.
+4. Switch `MODEL_SIZE` to the multilingual `small` model for spoken
+   Bemba/Nyanja/Tonga.
 5. Set a real `DABARSTREAM_KEY` BEFORE running `deploy_vps.sh` (same value on VPS service
    file, streaming-PC `$env:DABARSTREAM_KEY`, and the /control password field).
 6. Deploy to the VPS; add the OCI VCN Ingress Rule for TCP 5000 (script cannot do this).
 7. Verify the overlay in OBS and the `/control` panel.
+8. Copy `bible.db` (~900k rows) to the VPS — it is git-ignored, so it must be
+   transferred separately (scp/rsync) and regenerated there if the file is
+   licenced-material-sensitive.
 
 ## Superseded history (older log entries, kept for provenance)
 - Path sweep (direct file reads, full tree visible via read_files; search index stale):

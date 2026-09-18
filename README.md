@@ -14,6 +14,8 @@ OBS (or any software supporting browser sources / NDI via DistroAV).
   fuzzy book-alias resolver, SQLite lookup, serves `/overlay` for OBS Browser Source.
 - `importer.py`: builds `bible.db` from FreeShow JSON, BibleShow delimited text,
   EasyWorship CSV, or Zefania/OpenSong XML (African-language modules).
+- `import_bibles.py`: bulk-loads the curated `Bibles/` collection (Zambian
+  languages + English majors, 33 translations) into `bible.db`; resumable.
 
 ## Multilingual translations
 Every row carries a `translation_code` (`eng`, `bem`, `nya`, `ton`, ...), so all
@@ -28,6 +30,41 @@ Import a local translation:
 ```python
 import_xml_translation("Bemba_Bible.xml", translation_code="bem")
 ```
+
+### Bulk import of the whole `Bibles/` library
+
+Drop XML modules into `Bibles/Holy-Bible-XML-Format-master/` and run:
+
+```powershell
+python import_bibles.py
+```
+
+It auto-detects the three schemas in use — **Holy-Bible-XML-Format**
+(`<book number=><chapter number=><verse number=>`), **Zefania**
+(`<BIBLEBOOK bnumber=><CHAPTER cnumber=><VERS vnumber=>`) and **OpenSong**
+(`<b n=><c n=><v n=>`) — and is safe to re-run: a manifest
+(`Bibles/_import_manifest.json`) skips files already imported, and a file that
+fails or yields no verses is reported so you can inspect it without the run
+dying half-way.
+
+Rules that keep every translation queryable:
+
+- Book names are always normalised to the canonical English 66 (derived from the
+  book number where the module provides one). Zefania modules sometimes ship a
+  localised name — ISV literally ships German `Matthäus` — and the Zambian
+  modules carry no names at all, so a single English key is used and
+  local-language names are matched through `BOOK_LOCAL_TO_ENGLISH` / `BOOK_ALIASES`.
+- Verse text is read with `itertext()`, so inline markup is preserved. King
+  James 2000 wraps its red-letter words in `<STYLE css=...>`, which would
+  otherwise truncate the verse at the first tag.
+- Malformed rows are skipped rather than raising, so one odd module cannot abort
+  the batch.
+
+Licensing: `eng_niv`, `eng_esv`, `eng_nlt`, `eng_nkjv`, `eng_nasb`, `eng_csb`,
+`eng_mev`, `eng_lsb`, `eng_gw`, `eng_net`, `eng_msg`, `eng_amp` and `eng_ampc`
+are copyrighted. They are imported for **private/church use only** — do not
+redistribute `bible.db` or those XML files publicly. `bible.db` is git-ignored,
+so the built database never leaves your machine unless you move it yourself.
 
 ## Switching languages live
 Three ways to change the active translation during a service:
@@ -69,10 +106,10 @@ again, and each overlay shows a short banner announcing the new translation.
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pytest             # run validation suite
-python importer.py # after uncommenting an import call, to build bible.db
-python server.py   # run locally for testing
-python client.py   # run on streaming machine (requires mic)
+pytest                      # validation suite (67 tests)
+python import_bibles.py     # build bible.db from the Bibles/ collection
+python server.py            # run locally for testing
+python client.py            # run on streaming machine (requires mic)
 ```
 
 ## OBS Integration

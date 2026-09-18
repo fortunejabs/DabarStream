@@ -21,6 +21,11 @@ bible.db
 *.sqlite3
 *.bible
 
+# Bible translation source files (licensing: keep OUT of git).
+# The Bibles/ folder itself is tracked via its README.md only.
+Bibles/*
+!Bibles/README.md
+
 # Local settings and secrets
 .env
 .env.*
