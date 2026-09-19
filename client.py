@@ -62,9 +62,12 @@ def disconnect():
     print("Disconnected from Cloud Streaming Hub. Retrying...")
 
 
-# Regex trigger scanning spoken language for scripture coordinates
+# Regex trigger scanning spoken language for scripture coordinates.
+# The book group allows an optional leading numeral so Whisper's digit form
+# keeps numbered books intact: "1 Timothy 3:16" -> book "1 Timothy" (not
+# "Timothy", which would lose the book entirely).
 verse_pattern = re.compile(
-    r"\b([A-Za-z-\s]+?)(?:\s+chapter)?\s+(\d+)(?:\s*:\s*|\s+verse\s+|\s+)(\d+)",
+    r"\b((?:\d+\s+)?[A-Za-z][A-Za-z-\s]*?)(?:\s+chapter)?\s+(\d+)(?:\s*:\s*|\s+verse\s+|\s+)(\d+)",
     re.IGNORECASE,
 )
 
@@ -79,6 +82,13 @@ NUMBER_WORDS = {
     "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
     "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
     "hundred": 100, "hundred and": 100,
+}
+
+# Number words that must bind to what follows them: "twenty three" is 23, not
+# 20:3. Consulted when splitting a bare two-number spoken reference.
+BINDING_NUMBER_WORDS = {
+    "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+    "ninety", "hundred",
 }
 
 
@@ -136,11 +146,14 @@ def parse_verse_reference(text):
     reference is detected. Digit form is tried first; spoken number words
     are the fallback. Number words are collected into maximal runs, with
     'chapter'/'verse'/':' acting as separators, so compound spoken numbers
-    ("twenty three", "one hundred and fifty") resolve correctly.
+    ("twenty three", "one hundred and fifty") resolve correctly. A bare
+    two-number form with no separator ("First John four eight") is split into
+    chapter/verse, unless the first word binds ("twenty three" stays 23).
     """
     digit_match = verse_pattern.search(text)
     if digit_match:
-        return digit_match.groups()
+        book, chapter, verse = digit_match.groups()
+        return " ".join(book.split()), chapter, verse
 
     tokens = text.split()
 
@@ -174,6 +187,16 @@ def parse_verse_reference(text):
             current = []
     if current:
         runs.append(" ".join(current))
+
+    if len(runs) == 1:
+        # Bare spoken form with no "chapter"/"verse" separator, e.g.
+        # "First John four eight" -> chapter 4, verse 8. Only a two-token run
+        # whose first word is a plain unit gets split; a binding word
+        # (tens/hundred) must stay joined, so "twenty three" remains 23
+        # instead of becoming 20:3.
+        parts = runs[0].split()
+        if len(parts) == 2 and parts[0] not in BINDING_NUMBER_WORDS:
+            runs = parts
 
     if len(runs) < 2:
         return None

@@ -149,3 +149,33 @@ def test_stage_route_serves_page():
 def test_control_route_still_serves():
     client = server_module.app.test_client()
     assert client.get("/control").status_code == 200
+
+
+# --- Deployment health probe ---------------------------------------------------
+def test_health_reports_missing_database():
+    """With no bible.db beside server.py, /health must report it, not 500."""
+    payload = server_module.app.test_client().get("/health").get_json()
+    assert payload["status"] == "ok"          # liveness is unaffected
+    assert payload["db_exists"] is False
+    assert "db_error" in payload
+
+
+def test_health_reports_verse_and_translation_counts(tmp_path, monkeypatch):
+    """A deployed database must surface counts, so one curl verifies a deploy."""
+    import json
+
+    from importer import import_freeshow_json
+
+    db = tmp_path / "bible.db"
+    monkeypatch.setattr(server_module, "DB_PATH", str(db))
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"John": {"3": {"16": "For God so loved..."}}}),
+                    encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=str(db))
+    import_freeshow_json(str(seed), translation_code="bem", db_path=str(db))
+
+    payload = server_module.app.test_client().get("/health").get_json()
+    assert payload["status"] == "ok"
+    assert payload["db_exists"] is True
+    assert payload["verses"] == 2
+    assert payload["translations"] == 2

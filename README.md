@@ -31,6 +31,23 @@ Import a local translation:
 import_xml_translation("Bemba_Bible.xml", translation_code="bem")
 ```
 
+### What spoken references are detected
+
+`client.parse_verse_reference` accepts both styles of Whisper output:
+
+- **digits** — `"John 3:16"`, `"1 Timothy 3:16"`. The leading numeral is kept, so
+  all twelve numbered books (1–2 Samuel, Kings, Chronicles, Corinthians,
+  Thessalonians, Timothy, Peter, 1–3 John) resolve instead of silently losing
+  the numeral.
+- **spoken numbers** — `"John chapter three verse sixteen"`,
+  `"Psalms twenty three verse one"`, compound values like
+  `"one hundred and fifty"`, and the bare two-number form
+  `"First John four eight"` (→ chapter 4, verse 8). A binding word keeps its
+  compound meaning, so `"twenty three"` is 23, never 20:3.
+
+The book itself may be English or any local alias (`Yohane`, `Ututendelo`) —
+see `BOOK_ALIASES` in `server.py`.
+
 ### Bulk import of the whole `Bibles/` library
 
 Drop XML modules into `Bibles/Holy-Bible-XML-Format-master/` and run:
@@ -46,6 +63,21 @@ It auto-detects the three schemas in use — **Holy-Bible-XML-Format**
 (`Bibles/_import_manifest.json`) skips files already imported, and a file that
 fails or yields no verses is reported so you can inspect it without the run
 dying half-way.
+
+```powershell
+python import_bibles.py                             # incremental (default)
+python import_bibles.py --force eng_msg eng_nivuk   # re-import these codes only
+python import_bibles.py --reset                     # ignore manifest; redo all
+python import_bibles.py --report                    # + full per-book listing (slow)
+```
+
+`--report` prints the per-book breakdown for every translation. It re-scans the
+whole table (~1M rows) and takes minutes, so it is opt-in; the default summary is
+a fast one-line-per-translation verse count.
+
+Use `--force` after changing the importer or a parser: it ignores the manifest
+for the named `translation_code`s and replaces their rows, without rebuilding
+every translation in the library.
 
 Rules that keep every translation queryable:
 
@@ -106,7 +138,7 @@ again, and each overlay shows a short banner announcing the new translation.
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pytest                      # validation suite (67 tests)
+pytest                      # validation suite (79 tests)
 python import_bibles.py     # build bible.db from the Bibles/ collection
 python server.py            # run locally for testing
 python client.py            # run on streaming machine (requires mic)
@@ -117,11 +149,47 @@ python client.py            # run on streaming machine (requires mic)
 2. For NDI output to vMix/Wirecast/etc., install DistroAV (obs-ndi) and enable NDI output.
 
 ## VPS Deployment (Oracle Linux 10)
-1. Copy `server.py`, `importer.py`, `bible.db`, `dabarstream.service`, `deploy_vps.sh` to the VPS.
-2. Run `sudo bash deploy_vps.sh` — installs deps, creates a locked service user, opens port 5000 in firewalld, and enables the `dabarstream` systemd service (auto-restart, journal logs via `journalctl -u dabarstream -f`).
-3. **Manual step the script cannot do:** OCI Console → VCN → Subnet → Security List → Ingress Rule: TCP 5000 from `0.0.0.0/0` (or restrict to your home IP).
-```bash
-sudo firewall-cmd --zone=public --add-port=5000/tcp --permanent
-sudo firewall-cmd --reload
-```
+
+Run these in order — steps 1–2 on your PC, the rest on the VPS.
+
+1. **Build the database locally.** It is git-ignored, so it must be transferred
+   separately:
+   ```powershell
+   python import_bibles.py     # writes bible.db (~1M rows, 33 translations)
+   ```
+2. **Copy the app files to the VPS:**
+   ```powershell
+   ssh opc@193.123.179.93 "mkdir -p /tmp/dabarstream"
+   scp server.py importer.py bible.db dabarstream.service deploy_vps.sh opc@193.123.179.93:/tmp/dabarstream/
+   ```
+3. **Set the stream key first.** Edit the `Environment=DABARSTREAM_KEY=...` line in
+   `dabarstream.service` before deploying — the service refuses to start while it
+   still reads `change-me-before-deploy`. Use the same key as the streaming PC.
+4. **Deploy:**
+   ```bash
+   cd /tmp/dabarstream && sudo bash deploy_vps.sh
+   ```
+   Creates a locked `dabarstream` service user, builds a **virtualenv** at
+   `/opt/dabarstream/.venv` (Oracle Linux 10 marks the system python as
+   externally managed — PEP 668 — so dependencies cannot go into it), opens
+   TCP 5000, and enables the systemd service.
+5. **Verify on the VPS** — this is the step that catches a missing database:
+   ```bash
+   curl -s http://127.0.0.1:5000/health
+   ```
+   Expect `{"status":"ok", ..., "db_exists":true, "verses":<big number>,
+   "translations":33}`. If `verses` is 0 or `db_error` is set, `bible.db` did not
+   arrive — copy it and `systemctl restart dabarstream`.
+6. **Open the port in OCI** (console only — the script cannot do this):
+   VCN → Subnet → Security List → Add Ingress Rule: Protocol TCP, Destination
+   Port 5000, Source **your home IP** rather than `0.0.0.0/0`.
+7. **Verify from your PC, then point OBS at it:**
+   ```powershell
+   curl http://193.123.179.93:5000/health
+   ```
+   - OBS Browser Source: `http://193.123.179.93:5000/overlay` (1920x1080, transparent)
+   - Control panel: `http://193.123.179.93:5000/control`
+   - Logs: `journalctl -u dabarstream -f`
+
+To redeploy after a code change, repeat steps 2, 4 and 5.
 

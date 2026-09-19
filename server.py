@@ -35,6 +35,10 @@ BOOK_ALIASES = {
     "phil": "philippians", "col": "colossians", "thess": "thessalonians",
     "tim": "timothy", "tit": "titus", "phm": "philemon", "heb": "hebrews",
     "jas": "james", "pet": "peter", "rev": "revelation",
+    # --- Spelling variants Whisper commonly returns for canonical names ---
+    "psalm": "psalms", "psalms of david": "psalms",
+    "song of songs": "song of solomon", "canticles": "song of solomon",
+    "revelations": "revelation", "apocalypse": "revelation",
     # Spoken Number Variations to Standard Books
     "first john": "1 john", "1st john": "1 john", "second john": "2 john",
     "2nd john": "2 john", "third john": "3 john", "3rd john": "3 john",
@@ -59,13 +63,41 @@ BOOK_ALIASES = {
     "chivumbulutso": "revelation",
     # --- Bemba book names ---
     "ututendelo": "genesis", "ukufuma": "exodus", "abena roma": "romans",
+    "mafumu": "kings", "1 mafumu": "1 kings", "2 mafumu": "2 kings",
+    "imilimo": "acts", "matayo": "matthew", "mako": "mark", "luka": "luke",
+    "petulo": "peter", "salimo": "psalms", "esaya": "isaiah",
+    "yeremiya": "jeremiah", "ezekieli": "ezekiel", "danieli": "daniel",
+    "hoseya": "hosea", "yoswa": "joshua", "abalamuzi": "judges",
+    "rute": "ruth", "samweli": "samuel", "1 samweli": "1 samuel",
+    "2 samweli": "2 samuel", "ezira": "ezra", "nehemiya": "nehemiah",
+    "esiteli": "esther", "yobu": "job", "amalango": "leviticus",
+    "abena korinto": "corinthians", "abena galatiya": "galatians",
+    "abena efeso": "ephesians", "abena filipi": "philippians",
+    "abena kolosai": "colossians", "abena tesalonika": "thessalonians",
+    "abena heburani": "hebrews", "ukubvumbuluka": "revelation",
+    # --- Chewa / Nyanja: book names shared with the Bemba map above ---
+    "eksodo": "exodus", "deuteronomo": "deuteronomy", "levitiko": "leviticus",
+    "numeri": "numbers", "owalamula": "judges", "masalmo": "psalms",
+    "masalimo": "psalms", "miyambo": "proverbs", "mlaliki": "ecclesiastes",
+    "nyimbo ya solomoni": "song of solomon", "yesaya": "isaiah",
+    "yeremiya": "jeremiah", "maliro": "lamentations", "yoweli": "joel",
+    "amosi": "amos", "obadiya": "obadiah", "yona": "jonah", "mika": "micah",
+    "nahumu": "nahum", "habakuku": "habakkuk", "sefaniya": "zephaniah",
+    "hagai": "haggai", "zekariya": "zechariah", "malaki": "malachi",
+    "akorinto": "corinthians", "tesalonika": "thessalonians",
+    "timoteo": "timothy", "yuda": "jude",
+    "1 akorinto": "1 corinthians", "2 akorinto": "2 corinthians",
+    "1 tesalonika": "1 thessalonians", "2 tesalonika": "2 thessalonians",
+    "1 timoteo": "1 timothy", "2 timoteo": "2 timothy",
+    "1 petulo": "1 peter", "2 petulo": "2 peter",
+    "1 yohane": "1 john", "2 yohane": "2 john", "3 yohane": "3 john",
     # --- Tonga book names ---
     "machingonzi": "genesis",
 }
 
 # Translation codes -> display labels for the overlay
 TRANSLATION_LABELS = {
-    "eng": "",        # primary line needs no label
+    "eng": "English",        # primary line needs no label
     "bem": "Icibemba",
     "nya": "Chinyanja",
     "ton": "Chitonga",
@@ -278,12 +310,15 @@ def resolve_book(raw_book: str) -> str:
 
 def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "eng",
                             db_path: str = None):
-    db_path = db_path or DB_PATH
     """
     Parses verbal shortcuts (in any supported language) and queries the
     database for the requested translation. Falls back to the English
     translation ('eng') when the requested language lacks the verse.
+
+    `db_path` is resolved at CALL time (not import time) so tests and the
+    desktop runtime can point at a different database.
     """
+    db_path = db_path or DB_PATH
     try:
         target_book = resolve_book(raw_book)
         print(f"[Routing Resolver]: '{raw_book}' -> '{target_book}' [{translation_code}]")
@@ -317,7 +352,29 @@ def show_overlay():
 
 @app.route("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness + readiness probe, used to verify a deployment.
+
+    Keys are additive: "status" is always present so existing checks keep
+    working, and the database fields let one curl confirm that bible.db was
+    actually deployed (a missing database serves no verses but still runs).
+    """
+    info = {"status": "ok"}
+    info["db_path"] = os.path.abspath(DB_PATH)
+    info["db_exists"] = os.path.exists(DB_PATH)
+    if info["db_exists"]:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM verses")
+            info["verses"] = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(DISTINCT translation_code) FROM verses")
+            info["translations"] = cursor.fetchone()[0]
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - report, never 500
+            info["db_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        info["db_error"] = "bible.db not found next to server.py"
+    return info
 
 
 CONTROL_HTML = """
@@ -728,6 +785,9 @@ def handle_timer_control(data):
 
 
 if __name__ == "__main__":
-    # Listen on all interfaces over port 5000
-    socketio.run(app, host="0.0.0.0", port=5000)
+    # Listen on all interfaces over port 5000.
+    # allow_unsafe_werkzeug: the bundled Werkzeug server is fine for a single
+    # church stream; without this flag newer Flask-SocketIO releases refuse to
+    # start when it detects a production environment.
+    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
 

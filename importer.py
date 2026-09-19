@@ -49,6 +49,13 @@ BOOK_LOCAL_TO_ENGLISH = {
     "abena roma": "romans",
     # --- Tonga ---
     "machingonzi": "genesis",
+    # --- Spelling variants modules/ASR commonly produce for English names ---
+    "psalm": "psalms",
+    "psalms of david": "psalms",
+    "song of songs": "song of solomon",
+    "canticles": "song of solomon",
+    "revelations": "revelation",
+    "apocalypse": "revelation",
 }
 
 

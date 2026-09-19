@@ -1,5 +1,150 @@
 # DabarStream Progress Monitor
 
+## Resume brief (paste this file at the start of a new Cline task)
+The most recent state is always the first dated section below; this block is the
+stable map of the project.
+
+- **Location:** `C:\Users\Jabs\Documents\GitHub\DabarStream`
+  (repo: `github.com/fortunejabs/DabarStream`, private, branch `main`)
+- **Test command / expected:**
+  `.venv\Scripts\python.exe -m pytest test_importer.py test_language.py test_slides.py`
+  -> **79 passed** (last observed run: 76; the +3 are new tests since)
+- **Modules:** `client.py` (Windows mic -> faster-whisper -> verse parsing ->
+  Socket.IO), `server.py` (VPS Flask-SocketIO engine: overlay / control / stage),
+  `importer.py` (single-file imports: FreeShow JSON, BibleShow, EasyWorship,
+  Zefania/OpenSong XML), `import_bibles.py` (bulk import of `Bibles/`).
+- **Deliberately NOT in git:** `.venv/`, `bible.db` (~1M rows, 33 translations),
+  `Bibles/**` sources. Transfer `bible.db` to the VPS separately (scp/rsync).
+- **Environment quirk:** Cline's integrated-terminal capture returns stale output
+  in this workspace. Reliable pattern: the user runs commands, Cline reads the
+  result files and edits source. Do not trust terminal echoes.
+- **Next actions:** see "Pending (user side)" at the end of this file. The
+  immediate milestone is **VPS deployment** — the 7-step runbook lives in
+  `README.md` under "VPS Deployment".
+
+## [2026-09-18 DEPLOYMENT MILESTONE: PEP 668 BLOCKER FOUND + HEALTH PROBE]
+Audited the deployment assets by reading them and found the deploy would have
+**failed outright on Oracle Linux 10**:
+
+- **`deploy_vps.sh` ran `python3 -m pip install flask flask-socketio`**, but
+  Oracle Linux 9+/10 mark the system interpreter as externally managed (PEP 668),
+  so pip refuses with `error: externally-managed-environment`. With `set -euo
+  pipefail` the script aborted at step 3 — before the service was ever installed.
+  Fixed: dependencies now install into a virtualenv at `/opt/dabarstream/.venv`,
+  and `dabarstream.service` `ExecStart` points at
+  `/opt/dabarstream/.venv/bin/python` instead of `/usr/bin/python3`.
+- **`firewall-cmd` aborted the entire script when firewalld was not running.**
+  Now firewalld is enabled first and the step is skipped with a note when
+  unavailable (OCI VCN ingress rules apply either way).
+- **Missing files failed confusingly, late.** The script now checks `server.py`,
+  `importer.py` and `dabarstream.service` up front and exits with a clear
+  message; `bible.db` is reported but optional.
+- **`ExecStartPre` guard** now uses `$${DABARSTREAM_KEY}` so `/bin/sh` expands it
+  (systemd otherwise expands `$VAR` itself, which word-splits).
+- **`/health` is now a real readiness probe** (additive keys; `status` unchanged):
+  reports `db_path`, `db_exists`, `verses`, `translations` and `db_error`. One
+  `curl` after deploy proves `bible.db` actually arrived — previously a missing
+  database started happily and silently served nothing.
+- **`socketio.run(..., allow_unsafe_werkzeug=True)`** so newer Flask-SocketIO
+  releases do not refuse to start when they detect a production environment.
+- 2 new tests (`test_health_reports_missing_database`,
+  `test_health_reports_verse_and_translation_counts`); **suite now 79 tests**.
+  NOTE: 79 is expected, not yet observed - the last confirmed run was 76.
+- README gained a 7-step deployment runbook with the expected `/health` output.
+- Removed a duplicated `WorkingDirectory=` line in the unit file.
+
+## [2026-09-18 NUMBERED-BOOK DIGIT FORM FIXED + `--report` FLAG]
+- **Fixed a real trigger-loss bug in `client.py`.** `verse_pattern` was
+  `\b([A-Za-z-\s]+?)...` - a book group that cannot contain digits, so in
+  Whisper's digit form the pattern matched *inside* the reference and dropped
+  the numeral: "1 Timothy 3:16" -> book "Timothy" (invalid -> no verse shown).
+  Twelve books were affected (1-2 Samuel, Kings, Chronicles, Corinthians,
+  Thessalonians, Timothy, Peter, 1-3 John). The book group now allows an
+  optional leading numeral and the capture is whitespace-normalised.
+- Guarded by 3 new tests in `test_language.py`; **suite now 77 tests**
+  (30 importer + 35 language + 12 slides).
+- Bare spoken references now work: "First John four eight" split into
+  chapter/verse when there is no "chapter"/"verse" word. A binding word keeps
+  its compound meaning (`BINDING_NUMBER_WORDS`), so "twenty three" stays 23
+  rather than becoming 20:3.
+- `import_bibles.py --report` makes the slow full per-book listing **opt-in**.
+  The default is now a fast one-line-per-code verse count - the old behaviour
+  re-scanned ~1M rows across 33 codes and looked hung (a Ctrl+C landed mid-report
+  even though every import had already succeeded).
+- Fixed a mid-edit inconsistency: `parse_args` returned 3 values while `main`
+  and its test still unpacked 2, which would have raised `ValueError` on every
+  run of `import_bibles.py`.
+
+## [2026-09-18 BEMBA/CHEWA SPOKEN-ALIAS SEED ADDED (UNVERIFIED)]
+- `server.py:BOOK_ALIASES` now carries a starter spoken-alias set for **all 66
+  books** in both Bemba and Chewa/Nyanja, including the numbered books
+  (`1 samweli`/`1 mafumu`/`1 akorinto`/`1 tesalonika`/`1 timoteo`/`1 petulo`/
+  `1-3 yohane`), which previously resolved to garbage.
+- ⚠️ **UNVERIFIED DATA:** these names are transcribed from a language reference,
+  not confirmed by a Bemba/Chewa speaker or a printed local Bible. They are
+  guarded by `test_chewa_bemba_spoken_aliases_resolve` and
+  `test_numbered_books_resolve_through_local_names` in `test_importer.py`
+  (suite now **74 tests**) so any correction lands in one place. Have a
+  Bemba/Chewa speaker confirm the spellings, then correct the map entries
+  and the tests together.
+- End-to-end test added: `resolve_and_query_bible("Yohane", 3, 16,
+  translation_code="bem")` returns the Bemba text rather than the English
+  fallback.
+- ~~Known limitation~~ **FIXED 2026-09-18** (see the top section): Whisper's
+  digit-form path used to drop the leading numeral for numbered books
+  ("1 Timothy 3:16" -> book "Timothy"). `client.parse_verse_reference` now keeps
+  it, so both "1 Timothy 3:16" and "First Timothy three sixteen" resolve.
+
+## [2026-09-18 PSALM KEY MISMATCH FOUND + `--force`/`--reset` CLI]
+All 33 translations now load (`All files imported successfully.`) and the suite
+was green at 67 — but reading the book report revealed a **silent wrong-answer
+bug**:
+
+- **`eng_msg`, `eng_nivuk`, `eng_rnkjv` stored `psalm` instead of `psalms`.**
+  Those three were imported in the mid-session batch *before* the canonical-name
+  override was added, so they kept the module's own spelling and the digest
+  manifest skipped them on the final run. Effect: a Psalms reference in those
+  translations **missed and silently fell through to the English (`eng`/KJV)
+  fallback** — wrong translation on screen, no error printed. This is exactly
+  the class of bug that only shows up mid-service.
+- Two more spelling gaps closed for **spoken input**: `server.BOOK_ALIASES` had
+  `"ps": "psalms"` but **not `"psalm"`**, and Whisper very commonly transcribes
+  *"Psalm 23"* singular — that would have failed to resolve. Added
+  `psalm`/`psalms of david`/`song of songs`/`canticles`/`revelations`/`apocalypse`.
+- Added the same spellings to `importer.BOOK_LOCAL_TO_ENGLISH` so the
+  single-file importer path behaves identically to the bulk loader.
+
+### New: `import_bibles.py` CLI (replaces the throwaway `_clean_manifestN.py` scripts)
+```powershell
+python import_bibles.py                     # normal: skips already-imported files
+python import_bibles.py --force eng_msg eng_nivuk   # re-import just these codes
+python import_bibles.py --reset             # ignore manifest, re-import everything
+```
+`--force` ignores the digest manifest for the named codes and replaces their
+rows (`DELETE` + `INSERT` are already scoped per `translation_code`), so an
+importer fix can be applied without rebuilding all ~1M rows. Arg parsing lives
+in `parse_args()` and is unit-tested; `main(argv)` is now callable and returns an
+exit code instead of exiting inline.
+
+### Also fixed
+- `resolve_and_query_bible` had `db_path = db_path or DB_PATH` placed **before**
+  its docstring, which silently set `__doc__ = None`. Reordered, and documented
+  the call-time resolution rule.
+
+### Tests
++4 (suite **67 -> 71**): `canonical_book_name` spelling map, `parse_args`
+force/reset normalisation, `BOOK_ALIASES` singular-Psalm coverage, and an
+end-to-end `resolve_and_query_bible("Psalm", 23, 1, ...)` hitting the stored
+`psalms` row rather than falling back.
+
+### Next command (user side)
+```powershell
+.venv\Scripts\python.exe import_bibles.py --force eng_msg eng_gnb eng_hcsb eng_nivuk eng_rnkjv eng_bbe eng_akjv
+.venv\Scripts\python.exe -m pytest test_importer.py test_language.py test_slides.py   # expect 74
+```
+The 7 forced codes are the ones imported before the canonical-name override; the
+re-run's book report should show **`Psalms`** for all seven.
+
 ## [2026-09-18 BULK BIBLE IMPORT: 33 translations, 30 imported / 3 pending]
 - `import_bibles.py` bulk-loads every XML under
   `Bibles/Holy-Bible-XML-Format-master/` into `bible.db`, keyed by
@@ -85,11 +230,17 @@
 - Environment `.venv` recreated with **Python 3.12.8** (was a non-portable copy of a 3.15 venv).
   `pip install -r requirements.txt` succeeded for every package including `pyaudio`,
   `faster-whisper`, `pynput`.
-- Last user-run `pytest` (BEFORE the P0 tests were added): **24 passed**
-  (`test_importer.py` 10 + `test_language.py` 14).
-- **Agent terminal is blocked in this environment** — commands return the user's stale
-  shell buffer. All agent verification is by direct file reads. The user must run
-  `pytest` to confirm the current count (it is now higher than 24).
+- Last confirmed user-run `pytest`: **67 passed**, then **71** after the four
+  Psalm/alias/CLI tests in the newest section. Keep this line updated.
+- `bible.db` holds **33 translations** (~950k rows) built by `import_bibles.py`.
+- **Agent terminal is blocked in this environment** — `run_commands` neither
+  executes nor captures output; it returns the user's stale shell buffer. All
+  agent verification is therefore by direct file reads.
+- **Proven workaround (saves whole sessions):** have the *user* run the command in
+  their own terminal, and have the agent verify by reading the output **file**
+  (`read_files` stays reliable when `run_commands` does not). Do not burn turns
+  retrying `run_commands`, and do not write throwaway `_diagN.py` scripts hoping
+  the terminal recovers — that pattern wasted several sessions in September.
 
 ## P0 code fixes (present in source, verified by file reads)
 1. **Shared-secret auth** — `server.py`: `is_authorized()` + `DABARSTREAM_KEY` env var,
@@ -154,30 +305,26 @@ this log. (The stale `.venv/pyvenv.cfg` was resolved when the venv was recreated
 - Three live language-switch paths: voice phrases (`LANG_COMMANDS`), hotkeys
   (1=eng 2=bem 3=nya 4=ton), and the `/control` panel.
 
-## Known stale docs
-- `README.md` now says "67 tests" (58 + the 9 new `import_bibles.py` parser
-  tests) and documents the bulk import. If the next `pytest` run returns a
-  different count, correct it there and in the bulk-import section above.
+## Test count
+Suite = **79 tests**: 30 in `test_importer.py`, 35 in `test_language.py`,
+14 in `test_slides.py`. Keep `README.md` in sync if this changes.
+Last confirmed green run: **76 collected** (75 passed + 1 bad assertion of mine,
+now fixed). 79 has not been observed yet.
 
 ## Pending (user side)
-1. Run `import_bibles.py` once more to finish `eng_kj2000` / `eng_bwe` /
-   `eng_isv`, then run `pytest` and confirm **67 passed**.
-2. Bulk translation import is now done via `import_bibles.py` (33 translations).
-   `importer.py`'s single-file helpers remain for one-off/FreeShow/EasyWorship
-   imports.
-3. Extend `BOOK_LOCAL_TO_ENGLISH` / `BOOK_ALIASES` to full 66-book maps per
-   language. **The Zambian XMLs carry no book names at all**, so Chewa/Bemba
-   spoken references (e.g. "Yohane", "Chiyambi", "Machitidwe") need alias
-   entries before voice triggering works in those languages.
+1. Confirm the suite is green at **79 passed**, then commit + push.
+2. Bulk translation import is **done** (33 translations via `import_bibles.py`).
+3. **Verify the Bemba/Chewa alias seed with a speaker** — the Zambian XMLs carry
+   no book names, so spoken "Yohane" / "Chiyambi" resolve only through
+   `BOOK_ALIASES`. The seed covers all 66 books but is UNVERIFIED.
 4. Switch `MODEL_SIZE` to the multilingual `small` model for spoken
    Bemba/Nyanja/Tonga.
-5. Set a real `DABARSTREAM_KEY` BEFORE running `deploy_vps.sh` (same value on VPS service
-   file, streaming-PC `$env:DABARSTREAM_KEY`, and the /control password field).
-6. Deploy to the VPS; add the OCI VCN Ingress Rule for TCP 5000 (script cannot do this).
-7. Verify the overlay in OBS and the `/control` panel.
-8. Copy `bible.db` (~900k rows) to the VPS — it is git-ignored, so it must be
-   transferred separately (scp/rsync) and regenerated there if the file is
-   licenced-material-sensitive.
+5. **Deploy: follow the 7-step runbook in README** ("VPS Deployment"). Order
+   matters — set `DABARSTREAM_KEY` in `dabarstream.service` *before* running
+   `deploy_vps.sh`, and copy `bible.db` (git-ignored) with scp.
+6. OCI Console: VCN Ingress Rule for TCP 5000 (the script cannot do this).
+7. Verify `/health` reports `verses` > 0, then check the overlay in OBS and the
+   `/control` panel.
 
 ## Superseded history (older log entries, kept for provenance)
 - Path sweep (direct file reads, full tree visible via read_files; search index stale):

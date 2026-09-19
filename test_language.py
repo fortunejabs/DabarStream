@@ -117,6 +117,43 @@ def test_parse_verse_reference_digits(client):
     assert client.parse_verse_reference("John 3:16") == ("John", "3", "16")
 
 
+def test_parse_verse_reference_digit_form_keeps_numbered_books(client):
+    """Whisper's digit form must not drop the leading numeral.
+
+    Regression: the book group originally excluded digits, so the pattern
+    matched at "Timothy" in "1 Timothy 3:16" and lost the numbered book
+    entirely. Twelve books are affected (1-2 Samuel, Kings, Chronicles,
+    Corinthians, Thessalonians, Timothy, Peter and 1-3 John).
+    """
+    assert client.parse_verse_reference("1 Timothy 3:16") == ("1 Timothy", "3", "16")
+    assert client.parse_verse_reference("2 Corinthians 5:17") == ("2 Corinthians", "5", "17")
+    assert client.parse_verse_reference("1 John 4:8") == ("1 John", "4", "8")
+    assert client.parse_verse_reference("2 Kings 5:14") == ("2 Kings", "5", "14")
+
+
+def test_parse_verse_reference_spoken_words_keep_numbered_books(client):
+    """Spoken ordinals must survive the word path too."""
+    book, chapter, verse = client.parse_verse_reference("First John four eight")
+    assert book.lower() == "first john"
+    assert (chapter, verse) == ("4", "8")
+
+
+def test_parse_verse_reference_does_not_split_binding_number_words(client):
+    """'twenty three' is 23, not 20:3 - a binding word must stay joined.
+
+    Guards the bare-form split: two adjacent number words are treated as
+    chapter/verse, but only when the first word does not bind to the next.
+    """
+    assert client.parse_verse_reference("John chapter twenty three") is None
+
+    # With an explicit verse separator the same words still resolve as 23:1.
+    book, chapter, verse = client.parse_verse_reference(
+        "John chapter twenty three verse one"
+    )
+    assert book.lower() == "john"
+    assert (chapter, verse) == ("23", "1")
+
+
 def test_parse_verse_reference_spoken_number_words(client):
     book, chapter, verse = client.parse_verse_reference(
         "John chapter three verse sixteen"

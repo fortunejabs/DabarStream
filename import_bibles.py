@@ -100,6 +100,25 @@ IMPORTS = [
     (r"EnglishTyndale1537Bible.xml", "eng_tyndale", "Tyndale 1537 (partial: pre-Canonical era)"),
 ]
 
+# Module spellings that differ from the canonical 66. Only reachable when a
+# module supplies NO book number, or was stored before the canonical override
+# existed (e.g. Zefania modules that say <BIBLEBOOK bname="Psalm">).
+BOOK_NAME_ALIASES = {
+    "psalm": "Psalms",
+    "psalms of david": "Psalms",
+    "song of songs": "Song of Solomon",
+    "canticles": "Song of Solomon",
+    "revelations": "Revelation",
+    "revelation of john": "Revelation",
+    "apocalypse": "Revelation",
+}
+
+
+def canonical_book_name(name):
+    """Map a module's own book spelling onto the canonical English name."""
+    clean = " ".join(name.split())
+    return BOOK_NAME_ALIASES.get(clean.lower(), clean)
+
 
 def missing_files():
     """IMPORTS entries whose XML is not present on disk.
@@ -242,18 +261,21 @@ def save_manifest(m):
         json.dump(m, f, indent=2)
 
 
-def import_file(rel, code):
+def import_file(rel, code, force=False):
     """Import one XML file. Returns True on success (or skip), False on error.
 
     A failure in one file must never abort the run: subsequent translations
-    still get their turn and the manifest only records real successes (so a
+    still get their turn, and the manifest only records real successes (so a
     file that parsed 0 verses - a schema variant - is retried next run).
+
+    `force=True` ignores the manifest and replaces the stored rows. Use it via
+    `--force CODE` after an importer fix so already-stored rows are corrected.
     """
     path = os.path.join(BASE, rel)
     try:
         digest = sha_file(path)
         manifest = load_manifest()
-        if manifest.get(rel) == digest:
+        if not force and manifest.get(rel) == digest:
             print(f"  SKIP (already imported): {rel}")
             return True
         tree = ET.parse(path)
@@ -263,7 +285,7 @@ def import_file(rel, code):
             return False
         rows = []
         for bname, cnum, vnum, text in parser(tree.getroot()):
-            bname = " ".join(bname.split())
+            bname = canonical_book_name(bname)
             if not bname:
                 continue
             norm = BOOK_LOCAL_TO_ENGLISH.get(bname.lower(), bname.lower())
@@ -290,10 +312,26 @@ def import_file(rel, code):
         return False
 
 
-def report_books():
+def report_books(verbose=False, codes=None):
+    """Summarise imported verses per translation.
+
+    Default is a compact one-line-per-code count (fast, uses the language
+    index). `verbose=True` prints the full per-book listing, which re-scans
+    every row and takes minutes on ~1M verses — hence opt-in via --report.
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    for code in sorted({c for _, c, _ in IMPORTS}):
+    wanted = sorted(codes) if codes else sorted({c for _, c, _ in IMPORTS})
+    if not verbose:
+        print("\n--- Verse counts per translation ---")
+        for code in wanted:
+            cur.execute(
+                "SELECT COUNT(*) FROM verses WHERE translation_code=?", (code,))
+            n = cur.fetchone()[0]
+            print(f"  {code:<14} {n:>7} verses")
+        conn.close()
+        return
+    for code in wanted:
         cur.execute(
             "SELECT book_name, book_normalized, COUNT(*) FROM verses"
             " WHERE translation_code=? GROUP BY book_name, book_normalized"
@@ -306,28 +344,86 @@ def report_books():
     conn.close()
 
 
-if __name__ == "__main__":
+def parse_args(argv):
+    """Parse CLI flags. Returns (force_codes, reset_all, verbose).
+
+    --force CODE [CODE...]  re-import just those translation codes, ignoring
+                            the manifest. Use after an importer/parser fix so
+                            already-stored rows are corrected.
+    --reset                 ignore the manifest entirely and re-import all.
+    --report                print the full per-book listing (slow on big DBs).
+    """
+    force = set()
+    reset_all = False
+    verbose = False
+    saw_force = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--reset":
+            reset_all = True
+        elif arg == "--report":
+            verbose = True
+        elif arg == "--force":
+            saw_force = True
+            i += 1
+            while i < len(argv) and not argv[i].startswith("--"):
+                force.add(argv[i].strip().lower())
+                i += 1
+            continue
+        else:
+            print(f"  (ignoring unknown argument: {arg})")
+        i += 1
+    if saw_force and not force:
+        print("  (--force given without any translation codes - nothing forced)")
+    return force, reset_all, verbose
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    force_codes, reset_all, verbose = parse_args(argv)
+
     missing = missing_files()
     if missing:
         print("MISSING FILES:")
         for rel in missing:
             print("  -", rel)
         print("Fix the paths or trim IMPORTS, then re-run.")
-        sys.exit(1)
+        return 1
+
+    known = {code for _, code, _ in IMPORTS}
+    unknown = sorted(force_codes - known)
+    if unknown:
+        print(f"  (--force codes not in IMPORTS, ignored: {', '.join(unknown)})")
+
+    if reset_all:
+        print("--reset: ignoring the manifest and re-importing every translation")
+        save_manifest({})
 
     failed = []
     for rel, code, label in IMPORTS:
-        print(f"[{label}] {code}:")
-        if not import_file(rel, code):
+        forced = reset_all or code in force_codes
+        print(f"[{label}] {code}:{'  (forced re-import)' if forced else ''}")
+        if not import_file(rel, code, force=forced):
             failed.append(rel)
-    report_books()
+
+    report_books(verbose=verbose)
+
     if failed:
         print(f"\n{len(failed)} file(s) NOT imported:")
         for rel in failed:
             print("  -", rel)
     else:
         print("\nAll files imported successfully.")
-    print("\nDONE. Next: review the book lists above, then fill BOOK_LOCAL_TO_ENGLISH")
-    print("(importer.py) and BOOK_ALIASES (server.py) with the bem/nya names.")
+    if verbose:
+        print("\nDONE. Next: review the book lists above, then fill BOOK_LOCAL_TO_ENGLISH")
+        print("(importer.py) and BOOK_ALIASES (server.py) with any remaining bem/nya names.")
+    else:
+        print("\nDONE. Re-run with --report for the full per-book listing.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 

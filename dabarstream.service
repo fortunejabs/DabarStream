@@ -9,15 +9,17 @@ Type=simple
 User=dabarstream
 Group=dabarstream
 WorkingDirectory=/opt/dabarstream
-# Uses the system python3 on Oracle Linux 10; alternatively point to a venv:
-# ExecStart=/opt/dabarstream/.venv/bin/python /opt/dabarstream/server.py
-ExecStart=/usr/bin/python3 /opt/dabarstream/server.py
+# Dependencies live in a virtualenv created by deploy_vps.sh: Oracle Linux 9+/10
+# mark the system python as "externally managed", so pip refuses to install into
+# it (PEP 668). Point ExecStart at the venv interpreter, not /usr/bin/python3.
+ExecStart=/opt/dabarstream/.venv/bin/python /opt/dabarstream/server.py
 # Shared secret every client/control-panel emit must carry. SET THIS VALUE
 # during deployment (same key as the streaming PC's $env:DABARSTREAM_KEY).
 # The ExecStartPre guard below refuses to start the service while the
 # placeholder is still in place, so a keyless VPS can never go live.
 Environment=DABARSTREAM_KEY=change-me-before-deploy
-ExecStartPre=/bin/sh -c 'test "$DABARSTREAM_KEY" != "change-me-before-deploy" || (echo "FATAL: set a real DABARSTREAM_KEY in dabarstream.service before starting" >&2; exit 1)'
+# $$ is a literal $ for systemd, so /bin/sh expands the variable itself.
+ExecStartPre=/bin/sh -c 'test "$${DABARSTREAM_KEY}" != "change-me-before-deploy" || (echo "FATAL: set a real DABARSTREAM_KEY in dabarstream.service before starting" >&2; exit 1)'
 Restart=always
 RestartSec=5
 StandardOutput=journal

@@ -391,3 +391,162 @@ def test_detect_parser_recognises_all_three_schemas():
     assert import_bibles.detect_parser(zef) is import_bibles.parse_zefania
     assert import_bibles.detect_parser(osg) is import_bibles.parse_opensong
     assert import_bibles.detect_parser(other) is None
+
+
+def test_canonical_book_name_maps_module_spellings():
+    """Modules that spell a book differently must still land on the shared key."""
+    import import_bibles
+
+    assert import_bibles.canonical_book_name("Psalm") == "Psalms"
+    assert import_bibles.canonical_book_name("  psalm  ") == "Psalms"
+    assert import_bibles.canonical_book_name("Song of Songs") == "Song of Solomon"
+    assert import_bibles.canonical_book_name("Canticles") == "Song of Solomon"
+    assert import_bibles.canonical_book_name("Revelations") == "Revelation"
+    # Canonical names pass through untouched
+    assert import_bibles.canonical_book_name("John") == "John"
+    assert import_bibles.canonical_book_name("1 Corinthians") == "1 Corinthians"
+
+
+def test_parse_args_force_and_reset():
+    """CLI flags drive selective re-import after an importer fix."""
+    import import_bibles
+
+    force, reset, verbose = import_bibles.parse_args([])
+    assert force == set() and reset is False and verbose is False
+
+    force, reset, verbose = import_bibles.parse_args(["--force", "eng_msg", "ENG_NIVUK"])
+    assert force == {"eng_msg", "eng_nivuk"}      # normalised to lowercase
+    assert reset is False and verbose is False
+
+    force, reset, verbose = import_bibles.parse_args(["--force"])
+    assert force == set() and reset is False      # warns, forces nothing
+
+    force, reset, verbose = import_bibles.parse_args(["--reset"])
+    assert force == set() and reset is True
+
+    # --force consumes codes up to the next flag, so --reset still registers
+    force, reset, verbose = import_bibles.parse_args(["--force", "eng_bbe", "--reset"])
+    assert force == {"eng_bbe"} and reset is True
+
+    # --report opts into the slow full per-book listing
+    force, reset, verbose = import_bibles.parse_args(["--report"])
+    assert verbose is True and force == set() and reset is False
+
+    # flags combine in any order
+    force, reset, verbose = import_bibles.parse_args(["--report", "--force", "bem"])
+    assert force == {"bem"} and verbose is True
+
+
+def test_server_resolves_singular_psalm_alias():
+    """Whisper often returns 'Psalm 23'; the alias map must cover it."""
+    from server import BOOK_ALIASES
+
+    assert BOOK_ALIASES["psalm"] == "psalms"
+    assert BOOK_ALIASES["ps"] == "psalms"
+    assert BOOK_ALIASES["song of songs"] == "song of solomon"
+
+
+def test_server_finds_psalms_when_spoken_as_singular_psalm(tmp_path):
+    """A 'Psalm' variant must hit the stored 'psalms' row instead of falling back."""
+    seed = tmp_path / "eng.json"
+    seed.write_text(
+        json.dumps({"Psalms": {"23": {"1": "The LORD is my shepherd; I shall not want."}}}),
+        encoding="utf-8",
+    )
+    import_freeshow_json(str(seed), translation_code="eng")
+
+    from server import resolve_and_query_bible
+
+    result = resolve_and_query_bible("Psalm", 23, 1, translation_code="eng", db_path=DB_PATH)
+    assert result is not None
+    assert result[0] == "Psalms"
+    assert "shepherd" in result[3]
+
+
+# ---------------------------------------------------------------------------
+# Bemba / Chewa spoken-alias seed (UNVERIFIED - see PROGRESS.md)
+# ---------------------------------------------------------------------------
+def test_chewa_bemba_spoken_aliases_resolve():
+    """Starter Bemba/Chewa aliases must resolve to the canonical English key.
+
+    UNVERIFIED: transcribed from a language reference, not yet confirmed by a
+    Bemba/Chewa speaker or against a printed local Bible. Correct any that are
+    wrong rather than deleting the test.
+    """
+    from server import resolve_book
+
+    chewa = {
+        "Yohane": "john", "Mateyu": "matthew", "Marko": "mark",
+        "Lukasi": "luke", "Machitidwe": "acts", "Aroma": "romans",
+        "Masalmo": "psalms", "Miyambo": "proverbs", "Mlaliki": "ecclesiastes",
+        "Yesaya": "isaiah", "Yeremiya": "jeremiah", "Ezekieli": "ezekiel",
+        "Danieli": "daniel", "Yona": "jonah", "Malaki": "malachi",
+        "Chivumbulutso": "revelation", "Chibandakazi": "genesis",
+        "Ukufuma": "exodus", "Eksodo": "exodus", "Owalamula": "judges",
+        "Machingonzi": "genesis", "Deuteronomo": "deuteronomy",
+        "Levitiko": "leviticus", "Numeri": "numbers",
+        "Nyimbo ya Solomoni": "song of solomon", "Yoweli": "joel",
+        "Amosi": "amos", "Obadiya": "obadiah", "Mika": "micah",
+        "Nahumu": "nahum", "Habakuku": "habakkuk", "Sefaniya": "zephaniah",
+        "Hagai": "haggai", "Zekariya": "zechariah", "Yuda": "jude",
+        "Akorinto": "corinthians", "Tesalonika": "thessalonians",
+        "Timoteo": "timothy",
+    }
+    for spoken, canon in chewa.items():
+        assert resolve_book(spoken) == canon, f"{spoken} -> {canon}"
+
+    bemba = {
+        "Ututendelo": "genesis", "Ukufuma": "exodus", "Imilimo": "acts",
+        "Matayo": "matthew", "Mako": "mark", "Luka": "luke",
+        "Petulo": "peter", "Salimo": "psalms", "Esaya": "isaiah",
+        "Abena Roma": "romans", "Danieli": "daniel", "Yoswa": "joshua",
+        "Abalamuzi": "judges", "Rute": "ruth", "Samweli": "samuel",
+        "Amalango": "leviticus", "Abena Korinto": "corinthians",
+        "Abena Galatiya": "galatians", "Abena Efeso": "ephesians",
+        "Abena Filipi": "philippians", "Abena Kolosai": "colossians",
+        "Abena Tesalonika": "thessalonians", "Abena Heburani": "hebrews",
+        "Ukubvumbuluka": "revelation", "Yakobo": "james", "Yuda": "jude",
+        "Ezira": "ezra", "Nehemiya": "nehemiah", "Esiteli": "esther",
+        "Yobu": "job", "Yeremiya": "jeremiah", "Ezekieli": "ezekiel",
+        "Hoseya": "hosea",
+    }
+    for spoken, canon in bemba.items():
+        assert resolve_book(spoken) == canon, f"{spoken} -> {canon}"
+
+
+def test_numbered_books_resolve_through_local_names():
+    """Spoken '1 Mafumu' / '2 Samweli' / '1 Akorinto' must hit numbered keys."""
+    from server import resolve_book
+
+    assert resolve_book("1 Mafumu") == "1 kings"
+    assert resolve_book("2 Mafumu") == "2 kings"
+    assert resolve_book("1 Samweli") == "1 samuel"
+    assert resolve_book("2 Samweli") == "2 samuel"
+    assert resolve_book("1 Akorinto") == "1 corinthians"
+    assert resolve_book("2 Akorinto") == "2 corinthians"
+    assert resolve_book("1 Tesalonika") == "1 thessalonians"
+    assert resolve_book("2 Tesalonika") == "2 thessalonians"
+    assert resolve_book("1 Timoteo") == "1 timothy"
+    assert resolve_book("2 Timoteo") == "2 timothy"
+    assert resolve_book("1 Petulo") == "1 peter"
+    assert resolve_book("2 Petulo") == "2 peter"
+    assert resolve_book("1 Yohane") == "1 john"
+    assert resolve_book("2 Yohane") == "2 john"
+    assert resolve_book("3 Yohane") == "3 john"
+
+
+def test_server_resolves_bemba_yohane_end_to_end(tmp_path):
+    """'Yohane 3:16' spoken in Bemba must return the Bemba text, not English."""
+    seed = tmp_path / "bem.json"
+    seed.write_text(
+        json.dumps({"Yohane": {"3": {"16": "Pakuti Mulungu anali chikonda dziko..."}}}),
+        encoding="utf-8",
+    )
+    import_freeshow_json(str(seed), translation_code="bem")
+
+    from server import resolve_and_query_bible
+
+    result = resolve_and_query_bible("Yohane", 3, 16, translation_code="bem", db_path=DB_PATH)
+    assert result is not None
+    assert result[0] == "Yohane"
+    assert "Mulungu" in result[3]
