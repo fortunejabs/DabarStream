@@ -157,14 +157,33 @@ Run these in order — steps 1–2 on your PC, the rest on the VPS.
    ```powershell
    python import_bibles.py     # writes bible.db (~1M rows, 33 translations)
    ```
-2. **Copy the app files to the VPS:**
+2. **Copy the app files to the VPS.** Windows OpenSSH does **not** look in
+   `Downloads`, so the OCI private key must be passed explicitly or you get
+   `Permission denied (publickey)`:
    ```powershell
-   ssh opc@193.123.179.93 "mkdir -p /tmp/dabarstream"
-   scp server.py importer.py bible.db dabarstream.service deploy_vps.sh opc@193.123.179.93:/tmp/dabarstream/
+   $KEY = "C:\Users\Jabs\Downloads\ssh-key-2026-08-19.key"
+   ssh -i $KEY opc@193.123.179.93 "mkdir -p /tmp/dabarstream"
+   scp -i $KEY server.py importer.py bible.db dabarstream.service deploy_vps.sh opc@193.123.179.93:/tmp/dabarstream/
    ```
-3. **Set the stream key first.** Edit the `Environment=DABARSTREAM_KEY=...` line in
-   `dabarstream.service` before deploying — the service refuses to start while it
-   still reads `change-me-before-deploy`. Use the same key as the streaming PC.
+   If ssh reports `UNPROTECTED PRIVATE KEY FILE`, tighten the ACL:
+   ```powershell
+   icacls $KEY /inheritance:r /grant:r "$env:USERNAME:(R)"
+   ```
+   Cleaner alternative — move the key into `.ssh\` and add to `.ssh\config`
+   (`Host dabar` / `HostName 193.123.179.93` / `User opc` / `IdentityFile ...`),
+   after which it is just `ssh dabar` and `scp <files> dabar:/tmp/dabarstream/`.
+3. **Leave the stream key as the placeholder for now.** The committed unit keeps
+   `change-me-before-deploy` so the secret never enters version control. The first
+   start therefore **fails by design** (that is the unit's guard), and
+   `deploy_vps.sh` reports it clearly rather than aborting. Right after step 4,
+   set the real key on the VPS:
+   ```bash
+   sudo sed -i 's/^Environment=DABARSTREAM_KEY=.*/Environment=DABARSTREAM_KEY=YOUR-KEY/' \
+     /etc/systemd/system/dabarstream.service
+   sudo systemctl daemon-reload && sudo systemctl restart dabarstream
+   ```
+   Use the same value as the streaming PC's `$env:DABARSTREAM_KEY`. Re-running
+   `deploy_vps.sh` reinstalls the placeholder, so repeat this step afterwards.
 4. **Deploy:**
    ```bash
    cd /tmp/dabarstream && sudo bash deploy_vps.sh

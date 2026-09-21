@@ -21,8 +21,12 @@ dnf install -y python3 python3-pip firewalld
 echo "[2/7] Checking required files are present..."
 missing=0
 for f in server.py importer.py "$SERVICE_NAME.service"; do
-  if [ ! -f "$f" ]; then echo "  MISSING: $f" >&2; missing=1; fi
+  if [ ! -f "$f" ]; then
+    echo "  MISSING: $f" >&2
+    missing=1
+  fi
 done
+
 [ "$missing" -eq 0 ] || { echo "Copy the missing files here, then re-run." >&2; exit 1; }
 if [ -f bible.db ]; then
   echo "  bible.db found ($(du -h bible.db | cut -f1)) - will be installed"
@@ -44,7 +48,7 @@ echo "[5/7] Creating virtualenv and installing dependencies..."
 python3 -m venv "$VENV"
 [ -x "$VENV/bin/python" ] || { echo "venv creation failed - is python3-venv installed?" >&2; exit 1; }
 "$VENV/bin/python" -m pip install --upgrade pip
-"$VENV/bin/python" -m pip install flask flask-socketio
+"$VENV/bin/python" -m pip install flask flask-socketio simple-websocket
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 
 echo "[6/7] Opening firewall port $PORT..."

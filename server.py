@@ -6,21 +6,42 @@ broadcasts scripture to OBS browser-source overlays.
 """
 
 import hmac
+import json
 import os
 import re
 import sqlite3
-import json
 import time
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+)
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# async_mode is auto-detected (eventlet > gevent > Werkzeug).
+# Set DEBUG_SOCKETIO=1 in the environment to enable verbose protocol logging in journal.
+DEBUG_SOCKETIO = os.environ.get("DEBUG_SOCKETIO", "0").lower() in ("1", "true", "yes")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    logger=DEBUG_SOCKETIO,
+    engineio_logger=DEBUG_SOCKETIO,
+)
 
 DB_PATH = "bible.db"
 
-# Comprehensive map for speech-to-text anomalies and short prefixes
+# Comprehensive map for speech-to-text anomalies and short prefixes.
+# NOTE: the keys the importer writes come from BOOK_LOCAL_TO_ENGLISH in
+# importer.py. The two maps must never disagree on a VALUE, otherwise a verse
+# row is stored under a key the server never looks up and the verse becomes
+# permanently unreachable. Locked by
+# test_importer_aliases_resolve_identically_on_the_server.
 BOOK_ALIASES = {
     # Shorthand Acronyms
     "gen": "genesis", "exo": "exodus", "lev": "leviticus", "num": "numbers",
@@ -58,7 +79,8 @@ BOOK_ALIASES = {
     "chibandakazi": "genesis", "yohane": "john", "mateyu": "matthew",
     "marko": "mark", "lukasi": "luke", "machitidwe": "acts", "aroma": "romans",
     "agalatiya": "galatians", "efeso": "ephesians", "afilipi": "philippians",
-    "akolose": "colossians", "atimotheo": "timothy", "filemoni": "philemon",
+    "akolose": "colossians", "atimotheo": "timothy", "tito": "titus",
+    "filemoni": "philemon",
     "abahebri": "hebrews", "yakobo": "james", "pita": "peter",
     "chivumbulutso": "revelation",
     # --- Bemba book names ---
@@ -94,7 +116,6 @@ BOOK_ALIASES = {
     # --- Tonga book names ---
     "machingonzi": "genesis",
 }
-
 # Translation codes -> display labels for the overlay
 TRANSLATION_LABELS = {
     "eng": "English",        # primary line needs no label
@@ -221,11 +242,12 @@ def validate_timer_payload(data):
         ends_at = round(time.time() + minutes * 60, 1)
     return {"action": action, "label": label, "ends_at": ends_at}
 
+
 OVERLAY_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/socket.io.js"></script>
     <style>
         body { background-color: transparent; margin: 0px; overflow: hidden;
                font-family: 'Segoe UI', Tahoma, sans-serif; color: #ffffff; }
@@ -238,9 +260,15 @@ OVERLAY_HTML = """
         #text { font-size: 20px; line-height: 1.4; }
         #text-eng { font-size: 15px; line-height: 1.35; color: #dddddd;
                     font-style: italic; margin-top: 8px; display: none; }
+        /* Opt-in status readout for ?debug=1; hidden unless JS shows it. */
+        #debug { display: none; position: absolute; top: 8px; left: 8px;
+                 background: rgba(0, 0, 0, 0.85); color: #00ff88;
+                 font: 13px/1.4 Consolas, monospace; padding: 6px 10px;
+                 border-radius: 4px; z-index: 9999; white-space: pre; }
     </style>
 </head>
 <body>
+    <div id="debug"></div>
     <div id="lower-third">
         <div id="reference"></div>
         <div id="lang-label"></div>
@@ -255,6 +283,31 @@ OVERLAY_HTML = """
         const textElement = document.getElementById('text');
         const textEngElement = document.getElementById('text-eng');
         let hideTimeout;
+
+        // Opt-in diagnostics/persistence via query string, so the normal OBS
+        // output stays clean:
+        //   /overlay?debug=1          live connection + event counter (top-left)
+        //   /overlay?hold=1           verses never auto-hide
+        //   /overlay?debug=1&hold=1   both
+        const OVERLAY_QUERY = new URLSearchParams(location.search);
+        const DEBUG = OVERLAY_QUERY.has('debug');
+        const HOLD = OVERLAY_QUERY.has('hold');
+        const dbg = document.getElementById('debug');
+        let events = 0;
+
+        function debugState(extra) {
+            if (!DEBUG || !dbg) return;
+            dbg.style.display = 'block';
+            dbg.innerText = 'connected=' + socket.connected
+                          + '  events=' + events
+                          + (extra ? '  ' + extra : '');
+        }
+        if (DEBUG) {
+            socket.on('connect', function () { debugState('CONNECTED'); });
+            socket.on('disconnect', function () { debugState('DISCONNECTED'); });
+            setInterval(function () { debugState(); }, 1000);
+            debugState('boot');
+        }
         socket.on('language_changed', function(d) {
             // Brief banner announcing the active translation
             refElement.innerText = (d.lang_label || d.lang).toUpperCase();
@@ -268,7 +321,10 @@ OVERLAY_HTML = """
             clearTimeout(hideTimeout);
             box.style.opacity = "0";
         });
-        socket.on('update_overlay', function(data) {
+
+        // autoHide=true for live broadcasts (15s); false keeps a deep-linked
+        // verse on screen indefinitely, which is what a static OBS source wants.
+        function paint(data, autoHide) {
             clearTimeout(hideTimeout);
             refElement.innerText = data.book + " " + data.chapter + ":" + data.verse;
             langLabel.innerText = data.lang_label || "";
@@ -280,13 +336,53 @@ OVERLAY_HTML = """
                 textEngElement.style.display = "none";
             }
             box.style.opacity = "1";
-            hideTimeout = setTimeout(() => { box.style.opacity = "0"; }, 15000);
+            if (autoHide) {
+                hideTimeout = setTimeout(() => { box.style.opacity = "0"; }, 15000);
+            }
+        }
+
+        // Payloads carrying hold:true stay on screen instead of auto-hiding
+        // (see the /test?hold=1 self-test route).
+        socket.on('update_overlay', function(data) {
+            events++;
+            paint(data, HOLD ? false : !data.hold);
+            debugState('got update_overlay');
         });
+
+        socket.on('update_slide', function(data) {
+            events++;
+            clearTimeout(hideTimeout);
+            refElement.innerText = data.title;
+            langLabel.innerText = "";
+            textElement.innerText = (data.lines || []).join(" • ");
+            textEngElement.style.display = "none";
+            box.style.opacity = "1";
+            if (!HOLD) {
+                hideTimeout = setTimeout(() => { box.style.opacity = "0"; }, 15000);
+            }
+            debugState('got update_slide');
+        });
+
+        // Deep-link / preview, e.g.
+        //   /overlay?book=Yohane&chapter=3&verse=16&lang=nya
+        // Renders a fixed verse from /api/verse so the overlay can be verified
+        // without OBS, a microphone, or a live trigger.
+        (function () {
+            const q = new URLSearchParams(location.search);
+            if (!q.get('book')) return;
+            const url = '/api/verse?book=' + encodeURIComponent(q.get('book'))
+                      + '&chapter=' + encodeURIComponent(q.get('chapter') || '1')
+                      + '&verse=' + encodeURIComponent(q.get('verse') || '1')
+                      + '&lang=' + encodeURIComponent(q.get('lang') || 'eng');
+            fetch(url)
+                .then(function (r) { return r.json(); })
+                .then(function (d) { if (!d.error) paint(d, false); })
+                .catch(function () {});
+        })();
     </script>
 </body>
 </html>
 """
-
 
 def normalize_lang(code) -> str:
     """
@@ -298,10 +394,51 @@ def normalize_lang(code) -> str:
     return lang if lang in TRANSLATION_LABELS else None
 
 
+# Leading spoken number before a book name -> digit. Ordinals cover "first
+# john"; cardinals cover "one mafumu" (Bemba) and "one yohane" (Nyanja), which
+# Whisper returns as words rather than digits.
+_NUMBER_PREFIXES = (
+    ("first", "1"),
+    ("second", "2"),
+    ("third", "3"),
+    ("one", "1"),
+    ("two", "2"),
+    ("three", "3"),
+)
+
+
 def resolve_book(raw_book: str) -> str:
-    """Normalizes spoken variants and abbreviations into database keys."""
-    clean_book = raw_book.strip().lower().replace(".", "")
-    target_book = BOOK_ALIASES.get(clean_book, clean_book)
+    """Normalizes spoken variants and abbreviations into database keys.
+
+    Resolution order:
+      1. plain alias           "yohane"       -> "john"
+      2. numbered alias        "1 yohane"     -> "1 john"
+      3. spoken-number prefix  "first yohane" -> "1 yohane" -> "1 john"
+                               "one mafumu"   -> "1 mafumu" -> "1 kings"
+      4. otherwise the cleaned literal (already-canonical input passes through)
+
+    A BARE numbered-only book ("mafumu" -> "kings") is deliberately NOT
+    upgraded to a specific book: no Bible module defines a bare "kings", so
+    the lookup misses and nothing is broadcast. Showing the wrong book during
+    a service is worse than showing nothing. The numbered forms always work.
+    """
+    clean_book = " ".join(raw_book.strip().lower().replace(".", "").split())
+    target_book = BOOK_ALIASES.get(clean_book)
+    if target_book is None:
+        # Retry with a leading spoken number rewritten to a digit, so
+        # "first yohane" and "one mafumu" reach the numbered alias table.
+        for word, digit in _NUMBER_PREFIXES:
+            if clean_book.startswith(word + " "):
+                remainder = clean_book[len(word) + 1:]
+                numbered = digit + " " + remainder
+                alias = BOOK_ALIASES.get(numbered)
+                # Prefer the alias ("1 mafumu" -> "1 kings"); otherwise keep
+                # the digit form, which is itself the canonical key for books
+                # that are already numbered in every module ("1 kings").
+                target_book = alias if alias is not None else numbered
+                break
+    if target_book is None:
+        target_book = clean_book
     target_book = re.sub(r"\b1st\b", "1", target_book)
     target_book = re.sub(r"\b2nd\b", "2", target_book)
     target_book = re.sub(r"\b3rd\b", "3", target_book)
@@ -345,6 +482,37 @@ def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "e
         return None
 
 
+# ---------------------------------------------------------------------------
+# Socket.IO JavaScript client delivery.
+#
+# python-engineio 4.x no longer ships the browser client, so the historical
+# "/socket.io/socket.io.js" URL falls through to the Engine.IO handshake
+# handler and answers HTTP 400 ("The client is using an unsupported version of
+# the Socket.IO or Engine.IO protocols"). Every page that loaded that URL got
+# an undefined `io`, threw on `io()`, and rendered a blank overlay.
+#
+# "/js/" is deliberately OUTSIDE "/socket.io/" so Flask - not the Socket.IO
+# middleware - serves it. Vendor the file for offline church operation:
+#     curl -sSLo static/socket.io.js \
+#         https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js
+# When it is absent we redirect to the CDN so a fresh deploy still works.
+# ---------------------------------------------------------------------------
+SOCKETIO_CLIENT_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "static", "socket.io.js"
+)
+SOCKETIO_CLIENT_CDN = (
+    "https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"
+)
+
+
+@app.route("/js/socket.io.js")
+def socketio_client():
+    """Serve the Socket.IO browser client locally, else fall back to the CDN."""
+    if os.path.isfile(SOCKETIO_CLIENT_LOCAL):
+        return send_file(SOCKETIO_CLIENT_LOCAL, mimetype="application/javascript")
+    return redirect(SOCKETIO_CLIENT_CDN)
+
+
 @app.route("/overlay")
 def show_overlay():
     return render_template_string(OVERLAY_HTML)
@@ -377,11 +545,88 @@ def health():
     return info
 
 
+@app.route("/api/verse")
+def api_verse():
+    """Resolve one verse as JSON.
+
+    Backs the overlay's deep-link/preview mode:
+        /api/verse?book=Yohane&chapter=3&verse=16&lang=nya
+    Also useful for checking what the resolver actually returns without
+    needing OBS or a microphone.
+    """
+    book = (request.args.get("book") or "").strip()
+    if not book:
+        return jsonify({"error": "book is required"}), 400
+    try:
+        chapter = int(request.args.get("chapter") or 0)
+        verse = int(request.args.get("verse") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "chapter and verse must be integers"}), 400
+    if not 1 <= chapter <= 150 or not 1 <= verse <= 176:
+        return jsonify({"error": "chapter/verse out of range"}), 400
+
+    lang = normalize_lang(request.args.get("lang")) or "eng"
+    row = resolve_and_query_bible(book, chapter, verse, lang)
+    if row is None:
+        return jsonify({
+            "error": "no row for that book/chapter/verse/translation",
+            "book_normalized": resolve_book(book),
+            "chapter": chapter, "verse": verse, "lang": lang,
+        }), 404
+
+    display_book, ch, vs, text = row
+    payload = {
+        "book": display_book, "chapter": ch, "verse": vs, "text": text,
+        "lang": lang, "lang_label": TRANSLATION_LABELS.get(lang, lang),
+    }
+    if lang != "eng":
+        english = resolve_and_query_bible(book, chapter, verse, "eng")
+        if english:
+            payload["text_eng"] = english[3]
+            payload["book_eng"] = english[0]
+    return jsonify(payload)
+
+
+@app.route("/test")
+def test_broadcast():
+    """Broadcast a sample verse on demand - a self-test for the overlay.
+
+    Visit /test with an overlay tab open: if the lower-third appears, then the
+    Socket.IO broadcast and the browser-render path both work, and any failure
+    is upstream (capture client, or a stream-key mismatch). Safe to delete once
+    you no longer need it.
+    """
+    # Same shared-secret gate as the Socket.IO control events. Without this,
+    # /test would let anyone on the internet push a fake verse onto a live
+    # stream. Use /test?key=<DABARSTREAM_KEY>.
+    if not is_authorized(request.args.to_dict(flat=True)):
+        return jsonify({"error": "forbidden"}), 403
+
+    payload = {
+        "book": "John", "chapter": 3, "verse": 16,
+        "text": "For God so loved the world, that he gave his only begotten Son.",
+        "lang": "eng", "lang_label": "English",
+    }
+    # ?hold=1 keeps the verse on screen instead of auto-hiding after 15s, which
+    # makes the self-test far easier to see across two browser tabs.
+    if request.args.get("hold"):
+        payload["hold"] = True
+    # NOTE: the server-level SocketIO.emit() takes no `broadcast` argument -- it
+    # already targets every client when `to` is omitted. Passing broadcast=True
+    # raises "TypeError: Server.emit() got an unexpected keyword argument
+    # 'broadcast'". Only the handler-level flask_socketio.emit() accepts it
+    # (it converts it to to=None internally), so the calls in the @socketio.on
+    # handlers below are correct as written.
+    socketio.emit("update_overlay", payload)
+    print("[Test]: broadcast a sample update_overlay")
+    return jsonify({"sent": True, "event": "update_overlay", "payload": payload})
+
+
 CONTROL_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/socket.io.js"></script>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee;
                display: flex; flex-direction: column; align-items: center; padding: 30px; }
@@ -421,6 +666,30 @@ CONTROL_HTML = """
 
         function streamKey() { return document.getElementById('stream-key').value; }
 
+        // Remember the stream key per-browser so the operator does not have to
+        // retype it after every reload. It lives only in this browser
+        // (localStorage) and is never hardcoded into the page source, so a
+        // random visitor cannot lift it from the HTML.
+        const keyBox = document.getElementById('stream-key');
+        const CONTROL_QUERY = new URLSearchParams(location.search);
+        function saveKey() {
+            try { localStorage.setItem('dabarstream_key', keyBox.value); }
+            catch (e) { /* storage unavailable: ignore */ }
+        }
+
+        try {
+            keyBox.value = localStorage.getItem('dabarstream_key') || '';
+        } catch (e) { /* private mode: just leave it blank */ }
+        // /control?key=... pre-fills AND remembers it in one step.
+        if (CONTROL_QUERY.get('key')) {
+            keyBox.value = CONTROL_QUERY.get('key');
+            saveKey();
+        }
+        keyBox.addEventListener('input', saveKey);
+        // To confirm a key is actually accepted: click any language button.
+        // A wrong key is rejected server-side, no language_changed broadcast
+        // comes back, and the status line would stay unchanged.
+
         labels.forEach(item => {
             const [code, label] = item.split('|');
             const btn = document.createElement('button');
@@ -454,14 +723,13 @@ CONTROL_HTML = """
             socket.emit('clear_overlay', {key: streamKey()});
             status.innerText = 'Overlay cleared.';
         };
-
         // Phase 1: slide + timer controls. Null-guarded so this script keeps
         // working even before the matching HTML inputs/buttons are added.
         const slideBtn = document.getElementById('slide-btn');
         if (slideBtn) slideBtn.onclick = () => {
             const title = document.getElementById('slide-title').value.trim();
             const lines = document.getElementById('slide-lines').value
-                .split('\n').map(s => s.trim()).filter(Boolean);
+                .split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
             if (!title || !lines.length) {
                 status.innerText = 'Slide needs a title and at least one line.';
                 return;
@@ -515,7 +783,7 @@ STAGE_HTML = """
 <html>
 <head>
     <title>DabarStream - Stage Display</title>
-    <script src="/socket.io/socket.io.js"></script>
+    <script src="/js/socket.io.js"></script>
     <style>
         body { margin: 0; background: #111; color: #fff; font-family: 'Segoe UI', sans-serif;
                display: flex; flex-direction: column; align-items: center; padding: 24px; }
@@ -591,7 +859,6 @@ STAGE_HTML = """
 </body>
 </html>
 """
-
 
 @app.route("/stage")
 def stage_display():
@@ -678,16 +945,23 @@ def handle_set_language(data):
         print("[Auth]: Rejected set_language (bad or missing stream key)")
         return
     lang = normalize_lang((data or {}).get("lang"))
-    if lang:
-        CURRENT_LANG = lang
-        print(f"[Language Switch]: Active translation is now '{lang}'")
-        emit(
-            "language_changed",
-            {"lang": lang, "lang_label": TRANSLATION_LABELS.get(lang, lang)},
-            broadcast=True,
-        )
-    else:
+    if not lang:
         print(f"[Language Switch]: Ignored unknown translation code '{(data or {}).get('lang')}'")
+        return
+    if lang == CURRENT_LANG:
+        # No-op when the requested translation is already active. The voice
+        # client fires set_language whenever the preacher merely MENTIONS a
+        # language ("the English Bible"), and re-broadcasting that would wipe a
+        # verse off the overlay with the 3-second language banner.
+        print(f"[Language Switch]: '{lang}' already active - no broadcast")
+        return
+    CURRENT_LANG = lang
+    print(f"[Language Switch]: Active translation is now '{lang}'")
+    emit(
+        "language_changed",
+        {"lang": lang, "lang_label": TRANSLATION_LABELS.get(lang, lang)},
+        broadcast=True,
+    )
 
 
 @socketio.on("verse_triggered")
@@ -786,8 +1060,7 @@ def handle_timer_control(data):
 
 if __name__ == "__main__":
     # Listen on all interfaces over port 5000.
-    # allow_unsafe_werkzeug: the bundled Werkzeug server is fine for a single
-    # church stream; without this flag newer Flask-SocketIO releases refuse to
-    # start when it detects a production environment.
+    # allow_unsafe_werkzeug: newer Flask-SocketIO releases refuse to start on
+    # the Werkzeug fallback server (used when eventlet/gevent are absent)
+    # unless this flag is set. Harmless when eventlet is in use.
     socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
-

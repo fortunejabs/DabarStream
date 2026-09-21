@@ -5,12 +5,27 @@ Captures microphone audio, transcribes locally on CPU with faster-whisper
 """
 
 import os
+import queue
 import re
+import threading
+import time
 
 import numpy as np
-import pyaudio
 import socketio
 from faster_whisper import WhisperModel
+
+# --- AUDIO BACKEND ---------------------------------------------------------
+# Prefer sounddevice: it wraps PortAudio through ctypes and publishes prebuilt
+# wheels for every current CPython, so `pip install sounddevice` simply works.
+# PyAudio 0.2.14 has no Python 3.14 wheel and building it from source requires
+# MSVC Build Tools, so it is retained only as a fallback.
+try:
+    import sounddevice as sd
+    AUDIO_BACKEND = "sounddevice"
+except ImportError:  # pragma: no cover - depends on the host environment
+    sd = None
+    import pyaudio
+    AUDIO_BACKEND = "pyaudio"
 
 # --- NETWORK CONFIG ---
 TARGET_VPS_IP = "193.123.179.93"
@@ -26,6 +41,8 @@ DEFAULT_LANG = "eng"     # Translation to display: 'eng', 'bem', 'nya', 'ton'...
 # Shared secret sent with every control emit; must match DABARSTREAM_KEY in
 # the server environment. Empty disables auth (local dev only).
 STREAM_KEY = os.environ.get("DABARSTREAM_KEY", "")
+
+
 
 # Voice-activated language switching: spoken phrases -> translation codes
 LANG_COMMANDS = {
@@ -44,12 +61,24 @@ HOTKEY_LANGS = {"1": "eng", "2": "bem", "3": "nya", "4": "ton"}
 ACTIVE_LANG = DEFAULT_LANG
 
 # Audio capture defaults
-FORMAT = pyaudio.paInt16
+FORMAT = "int16"   # sounddevice dtype name; the PyAudio fallback maps this to paInt16
 CHANNELS = 1
 RATE = 16000
 CHUNK = 1024
 
 sio = socketio.Client()
+
+# Lock ensuring only one thread calls sio.connect() at a time.
+# Without this, the background reconnect manager and an accidental concurrent
+# call can both see sio.connected == False and fire simultaneously, leaving
+# the socket in an undefined double-connected state.
+_connect_lock = threading.Lock()
+
+# Bounded queue between the audio-capture producer and the Whisper worker.
+# maxsize=4 caps memory at ~4 * AUDIO_BUFFER_LIMIT seconds of audio; if the
+# worker falls behind (very slow CPU), old buffers are silently dropped via
+# the non-blocking put below rather than growing the queue without limit.
+_audio_queue: queue.Queue = queue.Queue(maxsize=4)
 
 
 @sio.event
@@ -262,16 +291,19 @@ def process_audio(audio_bytes, model, active_lang=None):
                 book, chapter, verse = match
                 book_cleaned = " ".join(book.split())
                 print(f"Trigger Detected -> {book_cleaned} {chapter}:{verse} [{active_lang}]")
-                sio.emit(
-                    "verse_triggered",
-                    {
-                        "book": book_cleaned,
-                        "chapter": chapter,
-                        "verse": verse,
-                        "lang": active_lang,
-                        "key": STREAM_KEY,
-                    },
-                )
+                try:
+                    sio.emit(
+                        "verse_triggered",
+                        {
+                            "book": book_cleaned,
+                            "chapter": chapter,
+                            "verse": verse,
+                            "lang": active_lang,
+                            "key": STREAM_KEY,
+                        },
+                    )
+                except Exception as e:
+                    print(f"Verse trigger could not reach VPS: {e}")
     return active_lang
 
 
@@ -303,11 +335,112 @@ def start_hotkey_listener():
         return None
 
 
+def _transcription_worker(model):
+    """Daemon thread: pulls audio buffers from _audio_queue and transcribes them.
+
+    Runs independently of the microphone capture loop so that a slow Whisper
+    inference pass never stalls the audio stream and causes buffer overflows.
+    Blocks on queue.get() between bursts, so it uses zero CPU when idle.
+    """
+    while True:
+        audio_bytes = _audio_queue.get()  # blocks until a buffer is ready
+        process_audio(audio_bytes, model)
+        _audio_queue.task_done()
+
+
+def capture_loop(model):
+    """Reads fixed-size int16 blocks from the microphone and queues them for transcription.
+
+    The actual Whisper inference happens in a separate daemon thread
+    (_transcription_worker) so this loop is never stalled by a slow CPU.
+    Runs until KeyboardInterrupt. Block size is CHUNK frames; a buffer is
+    queued every AUDIO_BUFFER_LIMIT seconds of audio.
+    """
+    audio_buffer = bytearray()
+    threshold = RATE * 2 * AUDIO_BUFFER_LIMIT  # 2 bytes per int16 sample
+
+    def _enqueue(buf):
+        """Non-blocking put; silently drops the oldest buffer when the queue is full."""
+        try:
+            _audio_queue.put_nowait(bytes(buf))
+        except queue.Full:
+            try:
+                _audio_queue.get_nowait()   # discard oldest
+                _audio_queue.task_done()
+            except queue.Empty:
+                pass
+            _audio_queue.put_nowait(bytes(buf))
+
+    if AUDIO_BACKEND == "sounddevice":
+        stream = sd.RawInputStream(
+            samplerate=RATE, blocksize=CHUNK, channels=CHANNELS, dtype=FORMAT
+        )
+        with stream:
+            while True:
+                data, _overflowed = stream.read(CHUNK)
+                audio_buffer.extend(bytes(data))
+                if len(audio_buffer) >= threshold:
+                    _enqueue(audio_buffer)
+                    audio_buffer.clear()
+    else:
+        audio = pyaudio.PyAudio()
+        stream = audio.open(
+            format=pyaudio.paInt16, channels=CHANNELS, rate=RATE,
+            input=True, frames_per_buffer=CHUNK,
+        )
+        try:
+            while True:
+                audio_buffer.extend(stream.read(CHUNK, exception_on_overflow=False))
+                if len(audio_buffer) >= threshold:
+                    _enqueue(audio_buffer)
+                    audio_buffer.clear()
+        finally:
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
+
+
+def connect_vps(url=VPS_URL):
+    """Attempts initial connection to the Cloud Streaming Hub.
+
+    Uses _connect_lock so this is safe to call from multiple threads.
+    """
+    with _connect_lock:
+        if sio.connected:
+            return True
+        try:
+            sio.connect(url)
+            return True
+        except Exception as e:
+            print(f"Could not reach VPS server ({e}). Running local capture anyway...")
+            return False
+
+
+def start_connection_manager(url=VPS_URL):
+    """Background thread that keeps the VPS connection alive.
+
+    Checks every 5 seconds and reconnects if disconnected.  _connect_lock
+    prevents this thread and connect_vps() from calling sio.connect()
+    concurrently, which would leave the socket in an undefined state.
+    """
+    def _manager():
+        while True:
+            time.sleep(5)
+            if not sio.connected:
+                with _connect_lock:
+                    if not sio.connected:  # double-checked inside the lock
+                        try:
+                            sio.connect(url)
+                        except Exception:
+                            pass  # will retry in 5 s
+    t = threading.Thread(target=_manager, daemon=True)
+    t.start()
+    return t
+
+
 def main():
-    try:
-        sio.connect(VPS_URL)
-    except Exception as e:
-        print(f"Could not reach VPS server: {e}. Running local capture anyway...")
+    connect_vps(VPS_URL)
+    start_connection_manager(VPS_URL)
 
     # Optional global hotkeys (1=English, 2=Bemba, 3=Nyanja, 4=Tonga)
     start_hotkey_listener()
@@ -315,29 +448,20 @@ def main():
     print("Loading optimized speech model into CPU registers...")
     model = WhisperModel(MODEL_SIZE, device="cpu", compute_type=COMPUTE_TYPE)
 
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK
-    )
+    # Start the Whisper worker *after* the model is loaded so the thread
+    # always has a valid model reference and never starts with None.
+    worker = threading.Thread(target=_transcription_worker, args=(model,), daemon=True)
+    worker.start()
 
+    print(f"Audio backend: {AUDIO_BACKEND}")
     print(
         f"\nListening live. Ready for Scripture cues... "
         f"(active translation: {ACTIVE_LANG})"
     )
-    audio_buffer = bytearray()
     try:
-        while True:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            audio_buffer.extend(data)
-            if len(audio_buffer) >= RATE * 2 * AUDIO_BUFFER_LIMIT:
-                process_audio(bytes(audio_buffer), model)
-                audio_buffer.clear()
+        capture_loop(model)
     except KeyboardInterrupt:
         print("\nHalting client process cleanly.")
-    finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
 
 
 if __name__ == "__main__":

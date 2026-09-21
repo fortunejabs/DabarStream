@@ -2,11 +2,13 @@
 flask
 flask-socketio
 python-socketio
+simple-websocket
 pytest
 
 # Local capture client (Windows streaming machine)
 # NOTE: requires Python 3.10-3.13; wheels for 3.15 beta may not exist yet.
 numpy
+sounddevice
 pyaudio
 faster-whisper
 

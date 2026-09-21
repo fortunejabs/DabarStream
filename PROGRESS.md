@@ -8,7 +8,7 @@ stable map of the project.
   (repo: `github.com/fortunejabs/DabarStream`, private, branch `main`)
 - **Test command / expected:**
   `.venv\Scripts\python.exe -m pytest test_importer.py test_language.py test_slides.py`
-  -> **79 passed** (last observed run: 76; the +3 are new tests since)
+  -> **79 passed** (verified 2026-09-18, commit 1807557)
 - **Modules:** `client.py` (Windows mic -> faster-whisper -> verse parsing ->
   Socket.IO), `server.py` (VPS Flask-SocketIO engine: overlay / control / stage),
   `importer.py` (single-file imports: FreeShow JSON, BibleShow, EasyWorship,
@@ -21,6 +21,25 @@ stable map of the project.
 - **Next actions:** see "Pending (user side)" at the end of this file. The
   immediate milestone is **VPS deployment** — the 7-step runbook lives in
   `README.md` under "VPS Deployment".
+
+## [2026-09-18 DEPLOY BLOCKED ON SSH KEY; 79 TESTS VERIFIED + PUSHED]
+- **79 passed** confirmed (`79 passed in 3.83s`) and pushed as commit `1807557`
+  ("Deployment hardening: PEP 668 venv, health probe, firewalld tolerance").
+- **Deployment blocked at the copy step:** `ssh opc@193.123.179.93` returned
+  `Permission denied (publickey,gssapi-keyex,gssapi-with-mic)`. Cause: Windows
+  OpenSSH only searches `%USERPROFILE%\.ssh\`, so the OCI key sitting in
+  `C:\Users\Jabs\Downloads\ssh-key-2026-08-19.key` was never offered. Fix is
+  `-i <key>` (or an `.ssh/config` host entry); documented in README step 2 along
+  with the `UNPROTECTED PRIVATE KEY FILE` ACL fix.
+- **Secret hygiene:** README step 3 now instructs setting `DABARSTREAM_KEY` on the
+  VPS after deploy (`sed` on the installed unit + restart) so the real key never
+  enters git. The unit's placeholder guard makes the first start fail by design,
+  and `deploy_vps.sh` reports that clearly.
+- **Repo pollution found:** the commit added `.snapshots/config.json`,
+  `.snapshots/readme.md`, `.snapshots/sponsors.md` - Cline's own snapshot
+  metadata, not project content. `.snapshots/` added to `.gitignore`; untrack the
+  already-committed copies with
+  `git rm -r --cached .snapshots && git commit -m "Untrack agent snapshot metadata"`.
 
 ## [2026-09-18 DEPLOYMENT MILESTONE: PEP 668 BLOCKER FOUND + HEALTH PROBE]
 Audited the deployment assets by reading them and found the deploy would have
@@ -308,23 +327,23 @@ this log. (The stale `.venv/pyvenv.cfg` was resolved when the venv was recreated
 ## Test count
 Suite = **79 tests**: 30 in `test_importer.py`, 35 in `test_language.py`,
 14 in `test_slides.py`. Keep `README.md` in sync if this changes.
-Last confirmed green run: **76 collected** (75 passed + 1 bad assertion of mine,
-now fixed). 79 has not been observed yet.
+Last verified green: **79 passed** (2026-09-18, commit `1807557`).
 
 ## Pending (user side)
-1. Confirm the suite is green at **79 passed**, then commit + push.
-2. Bulk translation import is **done** (33 translations via `import_bibles.py`).
-3. **Verify the Bemba/Chewa alias seed with a speaker** — the Zambian XMLs carry
+1. **Deploy** — follow the 7-step runbook in `README.md` ("VPS Deployment").
+   Currently blocked only by the SSH key: Windows OpenSSH does not search
+   `Downloads`, so pass it explicitly (`ssh -i $KEY opc@193.123.179.93 ...`).
+2. Verify `/health` on the VPS reports `verses` > 0 and `translations`:33, add the
+   OCI VCN ingress rule for TCP 5000, then load `/overlay` in OBS.
+3. Untrack the agent snapshot files that slipped into the last commit:
+   `git rm -r --cached .snapshots && git commit -m "Untrack agent snapshot metadata"`.
+4. **Verify the Bemba/Chewa alias seed with a speaker** — the Zambian XMLs carry
    no book names, so spoken "Yohane" / "Chiyambi" resolve only through
    `BOOK_ALIASES`. The seed covers all 66 books but is UNVERIFIED.
-4. Switch `MODEL_SIZE` to the multilingual `small` model for spoken
+5. Switch `MODEL_SIZE` to the multilingual `small` model for spoken
    Bemba/Nyanja/Tonga.
-5. **Deploy: follow the 7-step runbook in README** ("VPS Deployment"). Order
-   matters — set `DABARSTREAM_KEY` in `dabarstream.service` *before* running
-   `deploy_vps.sh`, and copy `bible.db` (git-ignored) with scp.
-6. OCI Console: VCN Ingress Rule for TCP 5000 (the script cannot do this).
-7. Verify `/health` reports `verses` > 0, then check the overlay in OBS and the
-   `/control` panel.
+6. **Phase 2 (next build milestone):** project save/load UI, slide themes and
+   transitions, preview pane in the control panel.
 
 ## Superseded history (older log entries, kept for provenance)
 - Path sweep (direct file reads, full tree visible via read_files; search index stale):

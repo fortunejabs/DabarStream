@@ -528,3 +528,237 @@ def test_server_serves_requested_local_language(client, tmp_path):
     eng = resolve_and_query_bible("John", 3, 16, translation_code="eng", db_path=db_path)
     assert eng is not None
     assert "loved the world" in eng[3]
+
+
+# --------------------------------------------------------------------------
+# Server P1: book-alias resolution (resolve_book)
+# --------------------------------------------------------------------------
+def test_resolve_book_reaches_numbered_local_language_books(client):
+    """Plain, abbreviated and numbered aliases all reach database keys."""
+    from server import resolve_book
+
+    assert resolve_book("John") == "john"
+    assert resolve_book("Jn.") == "john"          # abbreviation, trailing dot
+    assert resolve_book("yohane") == "john"       # Nyanja
+    assert resolve_book("1 yohane") == "1 john"   # numbered Nyanja
+    assert resolve_book("1 timoteo") == "1 timothy"  # numbered Chewa
+    assert resolve_book("1 mafumu") == "1 kings"     # numbered Bemba
+    assert resolve_book("2 mafumu") == "2 kings"
+
+
+def test_resolve_book_maps_spoken_ordinals_to_numbered_books(client):
+    """A spoken ordinal prefix must land on the numbered alias.
+
+    Regression: only the English ordinal form was aliased ("first john"), so
+    "first yohane" fell through to a literal lookup, never matched a row, and
+    the overlay silently showed nothing. The prefix is now rewritten to a
+    digit and retried against the numbered alias table.
+    """
+    from server import resolve_book
+
+    assert resolve_book("first yohane") == "1 john"
+    assert resolve_book("third yohane") == "3 john"
+    assert resolve_book("second mafumu") == "2 kings"
+    # The pre-existing explicit English aliases must keep working unchanged.
+    assert resolve_book("first john") == "1 john"
+    assert resolve_book("1st john") == "1 john"
+
+
+def test_resolve_book_passes_through_unknown_and_normalizes_whitespace(client):
+    """Already-canonical input survives; spacing/case/dots are collapsed."""
+    from server import resolve_book
+
+    assert resolve_book("  Song of Solomon  ") == "song of solomon"
+    assert resolve_book("1   kings") == "1 kings"
+    # Not in the alias table -> cleaned literal, never dropped or None.
+    assert resolve_book("Hezekiah") == "hezekiah"
+
+
+# --------------------------------------------------------------------------
+# Importer <-> server alias parity
+# --------------------------------------------------------------------------
+def test_importer_aliases_resolve_identically_on_the_server(client):
+    """Every alias the importer writes must resolve to that same key.
+
+    Regression: importer.py carried only three Bemba entries, so a Bemba XML
+    with bname="Mafumu" was stored as book_normalized="mafumu" while the
+    server resolved a spoken "mafumu" to "kings". Every such verse missed and
+    the overlay stayed blank with no error.
+
+    The invariant enforced here: for each K -> V in BOOK_LOCAL_TO_ENGLISH, a
+    speaker saying K must resolve to V, because V is what was written to the
+    database. The two maps may differ in coverage, but never in value.
+    """
+    from importer import BOOK_LOCAL_TO_ENGLISH
+    from server import resolve_book
+
+    drift = {
+        alias: (expected, resolve_book(alias))
+        for alias, expected in BOOK_LOCAL_TO_ENGLISH.items()
+        if resolve_book(alias) != expected
+    }
+    assert drift == {}, f"importer/server alias drift: {drift}"
+
+
+def test_bemba_kings_imports_and_resolves_as_reported(client):
+    """The mapping reported from the church: kings = mafumu."""
+    from importer import canonical_book_key
+    from server import resolve_book
+
+    assert canonical_book_key("Mafumu") == "kings"
+    assert canonical_book_key("1 Mafumu") == "1 kings"
+    assert canonical_book_key("2 Mafumu") == "2 kings"
+    # The import key and the spoken lookup key must be identical, otherwise
+    # the row exists but can never be found.
+    assert resolve_book("mafumu") == canonical_book_key("Mafumu")
+    assert resolve_book("1 mafumu") == canonical_book_key("1 Mafumu")
+    assert resolve_book("2 mafumu") == canonical_book_key("2 Mafumu")
+
+
+def test_resolve_book_maps_spoken_cardinal_prefixes(client):
+    """Whisper says "one mafumu"; the alias table is keyed "1 mafumu"."""
+    from server import resolve_book
+
+    assert resolve_book("one mafumu") == "1 kings"
+    assert resolve_book("two mafumu") == "2 kings"
+    assert resolve_book("one yohane") == "1 john"
+    assert resolve_book("one kings") == "1 kings"
+    assert resolve_book("two samweli") == "2 samuel"
+
+
+def test_bare_numbered_book_is_deliberately_not_guessed(client):
+    """A bare "Mafumu 5:14" must never be silently guessed as 1 or 2 Kings.
+
+    Decision recorded from the church (2026-09-21): leaving the overlay
+    unchanged is preferable to putting the WRONG book on screen. "mafumu"
+    resolves to the bare "kings" key, which no Bible module can define because
+    every module numbers Kings, so the lookup misses and handle_verse emits
+    nothing. The numbered forms are the supported path.
+    """
+    from server import resolve_book
+
+    assert resolve_book("mafumu") == "kings"
+    # The bare form is preserved, never upgraded to a specific book.
+    assert resolve_book("mafumu") not in ("1 kings", "2 kings")
+    assert resolve_book("kings") == "kings"
+    # Every numbered spelling works, so the operator always has a safe route.
+    assert resolve_book("1 mafumu") == "1 kings"
+    assert resolve_book("one mafumu") == "1 kings"
+    assert resolve_book("first mafumu") == "1 kings"
+    assert resolve_book("2 mafumu") == "2 kings"
+    assert resolve_book("two mafumu") == "2 kings"
+
+
+# --------------------------------------------------------------------------
+# /test broadcast route
+# --------------------------------------------------------------------------
+def test_test_broadcast_route_broadcasts_without_error(client, monkeypatch):
+    """Regression: server-level SocketIO.emit() rejects broadcast=True.
+
+    The overlay self-test route crashed in production with
+    "TypeError: Server.emit() got an unexpected keyword argument 'broadcast'".
+    broadcast=True is valid only on the handler-level flask_socketio.emit(),
+    which consumes it and converts it to to=None; SocketIO.emit() forwards
+    unknown kwargs straight to python-socketio, which no longer accepts it.
+    Omitting `to` already broadcasts to every connected client.
+    """
+    import server as server_module
+
+    monkeypatch.delenv(server_module.ENV_KEY_NAME, raising=False)
+    with server_module.app.test_request_context("/test"):
+        response = server_module.test_broadcast()
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["sent"] is True
+    assert body["event"] == "update_overlay"
+
+    # With a shared secret configured, the route must refuse a keyless caller -
+    # otherwise anyone could push a fake verse onto a live stream.
+    monkeypatch.setenv(server_module.ENV_KEY_NAME, "s3cret")
+    with server_module.app.test_request_context("/test"):
+        _, status = server_module.test_broadcast()
+    assert status == 403
+
+
+def test_api_verse_resolves_and_normalizes(client, monkeypatch, tmp_path):
+    """The overlay deep-link API must resolve aliases and honour the language."""
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "api.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text(
+        '{"1 Kings": {"5": {"14": "And he sent them to Lebanon..."}}}', encoding="utf-8"
+    )
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+
+    with server_module.app.test_request_context("/api/verse?book=1+mafumu&chapter=5&verse=14"):
+        ok = server_module.api_verse().get_json()
+    assert ok["book"] == "1 Kings"
+
+    # A bare numbered-only book must 404, never guess a specific book.
+    with server_module.app.test_request_context("/api/verse?book=mafumu&chapter=5&verse=14"):
+        missing, status = server_module.api_verse()
+    assert status == 404
+    assert missing.get_json()["book_normalized"] == "kings"
+
+    # Bad input is rejected, not crashed on.
+    with server_module.app.test_request_context("/api/verse?book=John&chapter=x&verse=1"):
+        _, status = server_module.api_verse()
+    assert status == 400
+    with server_module.app.test_request_context("/api/verse"):
+        _, status = server_module.api_verse()
+    assert status == 400
+
+
+def test_resolve_book_normalises_ordinal_abbreviations_outside_the_alias_table(client):
+    """Exercises the 1st/2nd/3rd word-boundary regex path directly.
+
+    Every real "1st X" book is already aliased, so this path only fires for
+    input the alias table does not know. It is asserted here because a mangled
+    escape in the pattern would make it match nothing and silently pass the
+    ordinal through unnormalised.
+    """
+    from server import resolve_book
+
+    assert resolve_book("1st zebra") == "1 zebra"
+    assert resolve_book("2nd zebra") == "2 zebra"
+    assert resolve_book("3rd zebra") == "3 zebra"
+
+
+def test_html_templates_have_no_broken_string_literals(client):
+    """Regression: a mangled escape left a real line break inside a JS string.
+
+    The control panel shipped with the slide handler's line-split written as a
+    string literal broken across two source lines, which raised "SyntaxError:
+    '' string literal contains an unescaped line break" and killed the ENTIRE
+    control-panel script: no io(), no language buttons, no verse form, so
+    /control could never emit anything.
+    """
+    from server import CONTROL_HTML, OVERLAY_HTML, STAGE_HTML
+
+    def broken(template):
+        hits = []
+        for i, line in enumerate(template.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("//") or stripped.startswith("<"):
+                continue
+            if stripped.endswith(("'", '"')) and (
+                stripped.count("'") % 2 or stripped.count('"') % 2
+            ):
+                hits.append((i, line))
+        return hits
+
+    for name, template in (
+        ("CONTROL_HTML", CONTROL_HTML),
+        ("OVERLAY_HTML", OVERLAY_HTML),
+        ("STAGE_HTML", STAGE_HTML),
+    ):
+        assert broken(template) == [], f"{name} has a broken string literal"
+
+
+
+
+
