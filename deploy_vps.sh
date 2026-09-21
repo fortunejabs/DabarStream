@@ -15,10 +15,10 @@ SERVICE_USER=dabarstream
 VENV="$APP_DIR/.venv"
 PORT=5000
 
-echo "[1/7] Installing system packages..."
-dnf install -y python3 python3-pip firewalld
+echo "[1/8] Installing system packages..."
+dnf install -y python3 python3-pip python3-venv firewalld
 
-echo "[2/7] Checking required files are present..."
+echo "[2/8] Checking required files are present..."
 missing=0
 for f in server.py importer.py "$SERVICE_NAME.service"; do
   if [ ! -f "$f" ]; then
@@ -36,22 +36,68 @@ else
   echo "        The service still starts, but /health will report 0 verses."
 fi
 
-echo "[3/7] Creating service user and app directory..."
+# ── Interactive stream-key prompt ──────────────────────────────────────────
+# The service file ships with a placeholder; read the real key from stdin now
+# so the operator doesn't have to hand-edit /etc/systemd/system/... later.
+# Non-interactive environments (CI/SCP pipes) can skip by pressing Enter, but
+# the ExecStartPre guard in the service file will block the service from
+# actually starting until the key is changed.
+if [ -t 0 ]; then
+  echo
+  echo "[Key Setup] Enter the DABARSTREAM_KEY for this deployment."
+  echo "  (Press Enter to leave the placeholder and set it later manually.)"
+  read -r -p "  DABARSTREAM_KEY: " _stream_key
+  if [ -n "$_stream_key" ]; then
+    # Patch the placeholder inside the SERVICE FILE COPY in the current dir.
+    # sed -i rewrites the file in-place before step 4 copies it to $APP_DIR.
+    sed -i "s|DABARSTREAM_KEY=change-me-before-deploy|DABARSTREAM_KEY=${_stream_key}|g" \
+      "${SERVICE_NAME}.service"
+    echo "  Key written to ${SERVICE_NAME}.service (will be installed in step 4)."
+  else
+    echo "  Skipped - remember to set DABARSTREAM_KEY before the service will start."
+  fi
+fi
+
+echo "[3/8] Creating service user and app directory..."
 id -u "$SERVICE_USER" &>/dev/null || useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
 mkdir -p "$APP_DIR"
 
-echo "[4/7] Installing application files..."
+echo "[4/8] Installing application files..."
 cp -v server.py importer.py "$APP_DIR"/
 if [ -f bible.db ]; then cp -v bible.db "$APP_DIR"/; fi
 
-echo "[5/7] Creating virtualenv and installing dependencies..."
+echo "[5/8] Creating virtualenv and installing dependencies..."
 python3 -m venv "$VENV"
 [ -x "$VENV/bin/python" ] || { echo "venv creation failed - is python3-venv installed?" >&2; exit 1; }
 "$VENV/bin/python" -m pip install --upgrade pip
 "$VENV/bin/python" -m pip install flask flask-socketio simple-websocket
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 
-echo "[6/7] Opening firewall port $PORT..."
+echo "[6/8] Configuring log rotation..."
+cat > /etc/logrotate.d/"$SERVICE_NAME" <<LOGEOF
+/var/log/journal/*/*.journal {
+    rotate 4
+    weekly
+    missingok
+    notifempty
+    compress
+    delaycompress
+    postrotate
+        systemctl kill --kill-who=main --signal=USR1 systemd-journald 2>/dev/null || true
+    endscript
+}
+LOGEOF
+# Also cap the total journal disk use for this unit so it never exceeds 100 MB
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/"$SERVICE_NAME".conf <<JEOF
+[Journal]
+SystemMaxUse=100M
+MaxFileSec=1week
+JEOF
+systemctl restart systemd-journald 2>/dev/null || true
+echo "  Log rotation configured (max 100 MB / 4 weeks)"
+
+echo "[7/8] Opening firewall port $PORT..."
 systemctl enable --now firewalld 2>/dev/null \
   || echo "  firewalld unavailable - relying on the OCI VCN security list"
 if firewall-cmd --state &>/dev/null; then
@@ -61,7 +107,7 @@ else
   echo "  firewalld not running - skipped (open TCP $PORT in the OCI VCN ingress rules)"
 fi
 
-echo "[7/7] Installing and starting systemd service..."
+echo "[8/8] Installing and starting systemd service..."
 install -m 0644 "$SERVICE_NAME.service" /etc/systemd/system/
 systemctl daemon-reload
 # A start failure here is usually the DABARSTREAM_KEY placeholder guard; report
@@ -85,10 +131,11 @@ Then from your PC once the ingress rule exists:
 Reminders (the script cannot do these):
  - OCI Console: VCN -> Subnet -> Security List -> Add Ingress Rule:
      Source: your home IP (recommended) or 0.0.0.0/0, Protocol TCP, Port $PORT
- - Set a real DABARSTREAM_KEY in /etc/systemd/system/$SERVICE_NAME.service
-   (the service refuses to start while the placeholder is unchanged), then:
+ - If you skipped the key prompt above, set DABARSTREAM_KEY in the service file:
+     vi /etc/systemd/system/$SERVICE_NAME.service
      systemctl daemon-reload && systemctl restart $SERVICE_NAME
  - Overlay for OBS:  http://<VPS_IP>:$PORT/overlay   (1920x1080, transparent)
  - Control panel:    http://<VPS_IP>:$PORT/control   (enter the same stream key)
  - Logs:             journalctl -u $SERVICE_NAME -f
+ - Log rotation:     /etc/logrotate.d/$SERVICE_NAME (max 100 MB / 4 weeks)
 EOF

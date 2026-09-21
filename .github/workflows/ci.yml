@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # sounddevice and pyaudio both require PortAudio native libs.
+          # On Ubuntu we install libportaudio2 first; pyaudio is built from
+          # source so we pass --no-binary pyaudio to force that path.
+          sudo apt-get install -y --no-install-recommends libportaudio2 portaudio19-dev
+          # Install the pinned server/test deps; skip pyaudio/sounddevice on CI
+          # since CI doesn't have a real audio device and the capture client is
+          # not tested here (no microphone, no faster-whisper model download).
+          pip install flask flask-socketio python-socketio simple-websocket pytest
+
+      - name: Run test suite
+        run: pytest -v --tb=short
+
+  lint:
+    name: Shell check (deploy_vps.sh)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Lint deploy_vps.sh
+        run: shellcheck deploy_vps.sh
