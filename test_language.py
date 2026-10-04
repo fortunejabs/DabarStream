@@ -759,6 +759,363 @@ def test_html_templates_have_no_broken_string_literals(client):
         assert broken(template) == [], f"{name} has a broken string literal"
 
 
+# --------------------------------------------------------------------------
+# Stream-key resolution (regression: an empty key silently broke the voice path)
+# --------------------------------------------------------------------------
+def test_stream_key_prefers_env_then_falls_back_to_the_key_file(tmp_path, monkeypatch):
+    """The key must be discoverable without hardcoding it in the source.
+
+    Regression: STREAM_KEY was read purely from os.environ with an empty
+    default, and run_client.ps1 never set that variable. The client therefore
+    sent key="" and the VPS rejected EVERY emit with "[Auth]: Rejected", so the
+    overlay looked dead while the socket was perfectly healthy.
+    """
+    import client as client_module
+
+    key_file = tmp_path / "stream_key.txt"
+    key_file.write_text("  from-file  ", encoding="utf-8")
+    monkeypatch.setattr(client_module, "_KEY_FILE", str(key_file))
+
+    monkeypatch.delenv("DABARSTREAM_KEY", raising=False)
+    assert client_module._load_stream_key() == "from-file"
+
+    monkeypatch.setenv("DABARSTREAM_KEY", "from-env")
+    assert client_module._load_stream_key() == "from-env"
+
+
+def test_stream_key_is_empty_when_nothing_is_configured(tmp_path, monkeypatch):
+    import client as client_module
+
+    monkeypatch.delenv("DABARSTREAM_KEY", raising=False)
+    monkeypatch.setattr(client_module, "_KEY_FILE", str(tmp_path / "missing.txt"))
+    assert client_module._load_stream_key() == ""
+
+
+# --------------------------------------------------------------------------
+# One sentence carrying both a language command and a verse
+# --------------------------------------------------------------------------
+def test_process_audio_emits_verse_when_the_sentence_also_names_a_language(client):
+    """'Let us read John 3:16 in English' must switch AND show the verse.
+
+    Regression: the language branch ended in `continue`, so the verse half of
+    the sentence was discarded and nothing reached the overlay even though the
+    speaker had clearly asked for a verse.
+    """
+    model = _FakeModel(["Let us read John 3:16 in English"])
+    client.process_audio(b"audio", model)
+
+    events = [e for e, _ in client.recorder.events]
+    assert "set_language" in events
+
+    verse_events = [p for e, p in client.recorder.events if e == "verse_triggered"]
+    assert len(verse_events) == 1
+    assert verse_events[0]["book"] == "John"
+    assert (verse_events[0]["chapter"], verse_events[0]["verse"]) == ("3", "16")
+    assert verse_events[0]["key"] == client.STREAM_KEY
+
+
+# --------------------------------------------------------------------------
+# Spoken lead-ins must not be folded into the book name
+# --------------------------------------------------------------------------
+def test_strip_lead_in_removes_spoken_preamble_only(client):
+    """'Let us read John' is a preamble plus a book, not a book name.
+
+    Regression: the detector captured the whole run of words before the
+    numbers, so 'Let us read John 3:16' resolved the book 'let us read john',
+    matched no row, and broadcast nothing - with no error logged anywhere.
+    """
+    assert client.strip_lead_in("Let us read John") == "John"
+    assert client.strip_lead_in("Now let us read John") == "John"
+    assert client.strip_lead_in("turn to 1 John") == "1 John"
+    assert client.strip_lead_in("the book of John") == "John"
+
+    # Real book names must survive untouched.
+    assert client.strip_lead_in("First John") == "First John"
+    assert client.strip_lead_in("Song of Solomon") == "Song of Solomon"
+    assert client.strip_lead_in("Yohane") == "Yohane"
+
+
+def test_parse_verse_reference_ignores_spoken_lead_in(client):
+    assert client.parse_verse_reference("Let us read John 3:16") == ("John", "3", "16")
+    assert client.parse_verse_reference("John 3:16") == ("John", "3", "16")
+    assert client.parse_verse_reference("1 Timothy 3:16") == ("1 Timothy", "3", "16")
+
+
+# --------------------------------------------------------------------------
+# Honest labelling when a translation has no rows
+# --------------------------------------------------------------------------
+def test_lang_label_admits_when_english_is_shown_instead(client, monkeypatch, tmp_path):
+    """'ton' has no rows, so the overlay must not silently say 'Chitonga'.
+
+    Regression: the UI and hotkey 4 offered Chitonga, the resolver fell back to
+    English text, and the label still read 'Chitonga' - so a correct fallback
+    looked like a broken translation on air.
+    """
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "labels.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text('{"John": {"3": {"16": "For God so loved the world..."}}}', encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+    server_module._TRANSLATION_HAS_DATA.clear()
+
+    assert server_module.lang_label_for("eng") == "English"
+    assert server_module.translation_has_data("ton") is False
+    assert server_module.lang_label_for("ton") == "Chitonga (English shown)"
+
+
+# --------------------------------------------------------------------------
+# Control panel: the slide/timer controls the script talks to must exist
+# --------------------------------------------------------------------------
+def test_control_panel_exposes_slide_and_timer_controls(client):
+    """The panel JS drives these ids; without the elements they were dead code."""
+    from server import CONTROL_HTML
+
+    for element_id in (
+        "slide-title", "slide-lines", "slide-btn",
+        "timer-minutes", "timer-label", "timer-start", "timer-stop", "timer-clear",
+    ):
+        assert 'id="' + element_id + '"' in CONTROL_HTML, element_id
+
+
+def test_control_panel_verse_emit_carries_the_active_language(client):
+    from server import CONTROL_HTML
+
+    assert "lang: currentLang," in CONTROL_HTML
+
+
+# --------------------------------------------------------------------------
+# Project listing URLs must be URL-encoded
+# --------------------------------------------------------------------------
+def test_project_list_urls_are_url_encoded(client, monkeypatch, tmp_path):
+    import server as server_module
+
+    monkeypatch.setattr(server_module, "PROJECTS_DIR", str(tmp_path))
+    (tmp_path / "Sunday Set.json").write_text("{}", encoding="utf-8")
+
+    listed = server_module.list_projects()
+    assert len(listed) == 1
+    assert listed[0]["url"] == "/api/projects/Sunday%20Set"
 
 
 
+
+
+
+# --------------------------------------------------------------------------
+# Phantom triggers from ordinary speech (wrong-verse-on-air class)
+# --------------------------------------------------------------------------
+def test_ordinary_speech_numbers_do_not_trigger_a_verse(client):
+    """Prose containing two numbers must not be read as a scripture reference.
+
+    Regression: the digit pattern accepted ANY word run as a book, so
+    "we have 3 16 members here" produced book "we have" and "the act 2 4 was
+    great" produced book "act" - which resolve_book maps to ACTS. The second
+    case put the WRONG VERSE on the overlay mid-service, the exact failure the
+    project already decided is worse than showing nothing.
+    """
+    for utterance in (
+        "we have 3 16 members here",
+        "turn with me to page 5 12",
+        "the meeting is at 10 30",
+        "the act 2 4 was great",
+        "we had a job 3 12 yesterday",
+        "give me 5 10 minutes",
+        "he is 3 12 years old",
+    ):
+        assert client.parse_verse_reference(utterance) is None, utterance
+
+
+def test_real_references_still_trigger_after_the_phantom_guard(client):
+    """The guard must not cost a single genuine trigger - including 'act'.
+
+    'Act 2:4' is a real request for the book of Acts; only the prose form
+    ('the act 2 4 was great') is rejected. Cue phrases ending in a stop-word
+    ('turn to Psalm 23', 'go to John 3') must also keep working.
+    """
+    expected = {
+        "John 3:16": ("John", "3", "16"),
+        "Let us read John 3:16": ("John", "3", "16"),
+        "Now let us read John 3:16": ("John", "3", "16"),
+        "1 Timothy 3:16": ("1 Timothy", "3", "16"),
+        "Act 2:4": ("Act", "2", "4"),
+        "Mark 5:6": ("Mark", "5", "6"),
+        "Job 3:12": ("Job", "3", "12"),
+        "Psalms 23:1": ("Psalms", "23", "1"),
+        "Rom 8:1": ("Rom", "8", "1"),
+        "1 John 4:8": ("1 John", "4", "8"),
+        "Genesis 1:1": ("Genesis", "1", "1"),
+    }
+    for utterance, want in expected.items():
+        assert client.parse_verse_reference(utterance) == want, utterance
+
+
+def test_cue_phrase_ending_in_a_stop_word_is_not_rejected(client):
+    """'turn to Psalm 23' is a command, not prose.
+
+    The phantom guard rejects an immediately-preceding stop-word, so it must
+    distinguish 'turn TO Psalm' (a cue verb precedes the stop-word) from
+    'the act' (bare filler). Without that distinction the guard swallowed a
+    perfectly good spoken reference.
+    """
+    assert client.parse_verse_reference("turn to Psalm 23 verse 1") == ("Psalm", "23", "1")
+    assert client.parse_verse_reference("go to John 3:16") == ("John", "3", "16")
+
+
+def test_looks_like_book_rejects_sentence_fragments(client):
+    assert client.looks_like_book("John") is True
+    assert client.looks_like_book("1 Timothy") is True
+    assert client.looks_like_book("Yohane") is True          # local language
+    assert client.looks_like_book("abena roma") is True      # multi-word local
+    assert client.looks_like_book("") is False
+    assert client.looks_like_book("the meeting is at") is False
+    assert client.looks_like_book("we have") is False
+    # 'the act' is accepted HERE because looks_like_book deliberately tolerates
+    # a spoken lead-in - the phrase could be 'the book of Acts'. Distinguishing
+    # prose from a reference is _lead_in_precedes_book's job, asserted below.
+    assert client.looks_like_book("the act") is True
+    assert client._lead_in_precedes_book("the act", "act") is True
+    assert client._lead_in_precedes_book("Act", "Act") is False
+    # A cue phrase ending in a stop-word is a command, not prose.
+    assert client._lead_in_precedes_book("turn to Psalm", "Psalm") is False
+
+
+# --------------------------------------------------------------------------
+# The fallback must not print the English verse twice
+# --------------------------------------------------------------------------
+def test_fallback_to_english_does_not_duplicate_the_verse(
+    client, monkeypatch, tmp_path
+):
+    """A local-language request served from English must render ONE line.
+
+    Regression: `nya` had no rows, the resolver fell back to English, and
+    handle_verse then added `text_eng` - the SAME English string - so the
+    overlay showed the identical verse twice (primary + italic subtitle).
+    """
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "dupe.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text('{"John": {"3": {"16": "For God so loved the world..."}}}',
+                    encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+    server_module._TRANSLATION_HAS_DATA.clear()
+
+    emitted = []
+    monkeypatch.setattr(server_module, "emit",
+                        lambda e, p, **k: emitted.append((e, p)))
+
+    server_module.handle_verse(
+        {"book": "John", "chapter": 3, "verse": 16, "lang": "nya"}
+    )
+
+    assert len(emitted) == 1
+    _, payload = emitted[0]
+    # The payload must report what was ACTUALLY served, not what was asked for.
+    assert payload["lang"] == "eng"
+    assert payload["lang_label"] == "English"
+    # And there must be no duplicate subtitle.
+    assert "text_eng" not in payload
+    assert "Mulungu" not in payload["text"]
+
+
+def test_real_local_translation_still_gets_its_english_subtitle(
+    client, monkeypatch, tmp_path
+):
+    """The duplicate fix must not remove the dual-language feature."""
+    import server as server_module
+    from importer import import_freeshow_json, import_xml_translation
+
+    db_path = str(tmp_path / "dual.db")
+    eng = tmp_path / "eng.json"
+    eng.write_text('{"John": {"3": {"16": "For God so loved the world..."}}}',
+                   encoding="utf-8")
+    import_freeshow_json(str(eng), translation_code="eng", db_path=db_path)
+
+    nya = tmp_path / "nya.xml"
+    nya.write_text(
+        '<XMLBIBLE><BIBLEBOOK bname="Yohane"><CHAPTER cnumber="3">'
+        '<VERSE vnumber="16">Pakuti Mulungu anachikonda dziko lapansi</VERSE>'
+        "</CHAPTER></BIBLEBOOK></XMLBIBLE>",
+        encoding="utf-8",
+    )
+    import_xml_translation(str(nya), translation_code="nya", db_path=db_path)
+
+    monkeypatch.setattr(server_module, "DB_PATH", db_path)
+    server_module._TRANSLATION_HAS_DATA.clear()
+
+    emitted = []
+    monkeypatch.setattr(server_module, "emit",
+                        lambda e, p, **k: emitted.append((e, p)))
+
+    server_module.handle_verse(
+        {"book": "John", "chapter": 3, "verse": 16, "lang": "nya"}
+    )
+
+    _, payload = emitted[0]
+    assert payload["lang"] == "nya"
+    assert "Mulungu" in payload["text"]
+    # A genuinely DIFFERENT English line must still be attached.
+    assert "text_eng" in payload
+    assert "loved the world" in payload["text_eng"]
+
+
+def test_query_reports_the_served_translation(monkeypatch, tmp_path):
+    """resolve_and_query_bible must disclose which code it actually served."""
+    import server as server_module
+    from importer import import_freeshow_json
+
+    db_path = str(tmp_path / "src.db")
+    seed = tmp_path / "eng.json"
+    seed.write_text('{"John": {"3": {"16": "For God so loved..."}}}', encoding="utf-8")
+    import_freeshow_json(str(seed), translation_code="eng", db_path=db_path)
+
+    # Requested nya, served eng -> with_source must say so.
+    row = server_module.resolve_and_query_bible(
+        "John", 3, 16, "nya", db_path=db_path, with_source=True
+    )
+    assert row is not None
+    assert row[4] == "eng"
+
+    # A genuine hit reports its own code.
+    row_eng = server_module.resolve_and_query_bible(
+        "John", 3, 16, "eng", db_path=db_path, with_source=True
+    )
+    assert row_eng[4] == "eng"
+
+    # Default shape stays a 4-tuple so existing callers are unaffected.
+    plain = server_module.resolve_and_query_bible("John", 3, 16, "eng", db_path=db_path)
+    assert len(plain) == 4
+
+
+# --------------------------------------------------------------------------
+# The Socket.IO browser client must be served locally
+# --------------------------------------------------------------------------
+def test_socketio_client_is_served_locally_not_redirected(client):
+    """The overlay must work with no internet.
+
+    Regression: static/socket.io.js was never committed, so /js/socket.io.js
+    always redirected to the cdnjs CDN. On a venue with no connectivity the
+    browser got an HTML error page instead of the client, `io` was undefined,
+    and the overlay rendered blank - the failure the route was added to fix.
+    """
+    import os
+
+    import server as server_module
+
+    assert os.path.isfile(server_module.SOCKETIO_CLIENT_LOCAL), (
+        "static/socket.io.js is missing - the overlay cannot load offline"
+    )
+
+    response = server_module.app.test_client().get("/js/socket.io.js")
+    assert response.status_code == 200
+    # A redirect here means the CDN fallback fired, which breaks offline use.
+    assert response.headers.get("Location") is None
+    assert len(response.data) > 10_000
+    assert b"Socket.IO" in response.data

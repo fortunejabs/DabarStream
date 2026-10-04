@@ -39,8 +39,32 @@ AUDIO_BUFFER_LIMIT = 4   # Evaluate incoming audio every N seconds
 DEFAULT_LANG = "eng"     # Translation to display: 'eng', 'bem', 'nya', 'ton'...
 
 # Shared secret sent with every control emit; must match DABARSTREAM_KEY in
-# the server environment. Empty disables auth (local dev only).
-STREAM_KEY = os.environ.get("DABARSTREAM_KEY", "")
+# the server environment.
+#
+# Resolution order:
+#   1. the DABARSTREAM_KEY environment variable (run_client.ps1 exports it)
+#   2. stream_key.txt next to this file (git-ignored; one bare line)
+#   3. "" - which DISABLES client-side auth and therefore makes the VPS reject
+#      every emit with "[Auth]: Rejected". main() warns loudly in that case,
+#      because the symptom (a silent overlay) looks like a broken socket.
+_KEY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "stream_key.txt"
+)
+
+
+def _load_stream_key():
+    """Env var first, then stream_key.txt, then empty."""
+    key = (os.environ.get("DABARSTREAM_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        with open(_KEY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+STREAM_KEY = _load_stream_key()
 
 
 
@@ -120,6 +144,191 @@ BINDING_NUMBER_WORDS = {
     "ninety", "hundred",
 }
 
+# Canonical book names plus the spoken forms Whisper most often produces. A
+# candidate book must match one of these before a trigger is emitted.
+#
+# WHY THIS EXISTS: the digit pattern matches any "words + number + number" run,
+# so ordinary preaching created phantom triggers - "we have 3 16 members" ->
+# book "we have", "the act 2 4 was great" -> book "act" -> resolve_book maps it
+# to ACTS and the WRONG VERSE goes on air (Acts 2:4). A garbage book that
+# happens to be a valid alias is the dangerous case; the rest merely log noise.
+# Requiring a known book name removes the whole class.
+#
+# Local-language names (Yohane, Mafumu, Salimo, ...) are NOT listed here; they
+# are accepted through _SINGLE_WORD_BOOK_MIN_LEN and the multi-word rule
+# below, and ultimately validated by the server's BOOK_ALIASES.
+_KNOWN_BOOKS = {
+    "genesis", "exodus", "leviticus", "numbers", "deuteronomy", "joshua",
+    "judges", "ruth", "samuel", "kings", "chronicles", "ezra", "nehemiah",
+    "esther", "job", "psalm", "psalms", "proverbs", "ecclesiastes",
+    "song of solomon", "isaiah", "jeremiah", "lamentations", "ezekiel",
+    "daniel", "hosea", "joel", "amos", "obadiah", "jonah", "micah",
+    "nahum", "habakkuk", "zephaniah", "haggai", "zechariah", "malachi",
+    "matthew", "mark", "luke", "john", "acts", "romans", "corinthians",
+    "galatians", "ephesians", "philippians", "colossians", "thessalonians",
+    "timothy", "titus", "philemon", "hebrews", "james", "peter", "jude",
+    "revelation",
+    # Common abbreviations Whisper actually emits.
+    "gen", "exo", "lev", "num", "deut", "josh", "judg", "ps", "prov",
+    "eccl", "isa", "jer", "lam", "ezek", "dan", "hos", "obad", "mic",
+    "nah", "hab", "zeph", "hag", "zech", "mal", "mat", "mk", "lk",
+    "jn", "act", "rom", "cor", "gal", "eph", "phil", "col", "thess",
+    "tim", "tit", "phm", "heb", "jas", "pet", "rev",
+    # Spoken ordinal/cardinal prefixes kept by the digit pattern.
+    "first", "second", "third", "one", "two", "three",
+}
+
+# Words that never appear in a Bible book name. A multi-word candidate
+# containing one is an ordinary sentence fragment, not a reference: phantom
+# triggers detected as books were "turn with me to page", "meeting is at",
+# "had a job" - each carried a stop-word, while every real multi-word book
+# name ("abena roma", "song of solomon", "nyimbo ya solomoni") is free of them.
+_BOOK_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+    "can", "could", "did", "do", "does", "for", "from", "had", "has",
+    "have", "he", "her", "here", "him", "his", "how", "i", "if", "in",
+    "into", "is", "it", "its", "just", "me", "my", "no", "not", "of",
+    "on", "or", "our", "out", "page", "she", "should", "so", "that",
+    "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "up", "us", "was", "we", "were", "what", "when",
+    "where", "which", "who", "will", "with", "would", "you", "your",
+}
+
+# Verbs that turn a following stop-word into a deliberate cue rather than
+# filler: "turn TO Psalm 23" and "go TO John 3" are commands, whereas
+# "the act 2 4" / "we have 3 16" are prose. Consulted only when a stop-word
+# sits immediately in front of the detected book.
+_BOOK_CUE_WORDS = {
+    "turn", "go", "come", "look", "read", "open", "see", "check",
+    "switch", "show", "give", "let", "take", "find", "sing", "quote",
+}
+
+
+def looks_like_book(book):
+    """True when `book` could plausibly be a Bible book name.
+
+    Guards against phantom triggers built from ordinary speech. Accepts:
+      * a known English book or abbreviation ("john", "1 timothy", "acts");
+      * a single local-language name of plausible length ("yohane", "mafumu"),
+        which the server validates against its alias table;
+      * a numbered form ("1 mafumu", "2 samweli").
+
+    Rejects sentence fragments such as "we have", "the meeting is at", and
+    "2024 we saw", which produced garbage books and, on a coincidental alias,
+    the wrong verse on air.
+    """
+    cleaned = " ".join((book or "").split()).lower()
+    if not cleaned:
+        return False
+    # Spoken lead-ins ('let us read', 'turn to') sit in front of a REAL book
+    # name, so they are removed before judging the remainder. The stop-word
+    # test below then only fires on words that consume the actual book, which
+    # is what separates 'let us read john' (a reference) from 'the act 2 4 was
+    # great' (prose).
+    cleaned = strip_lead_in(cleaned)
+    # Drop a leading numeral so "1 timothy" is checked as "timothy".
+    parts = cleaned.split()
+    if parts and parts[0].isdigit():
+        parts = parts[1:]
+    if not parts:
+        return False
+    core = " ".join(parts)
+    if core in _KNOWN_BOOKS:
+        return True
+    # A bare English ordinal that keeps no book ("first zebra") is not a book.
+    if core in {"first", "second", "third", "one", "two", "three"}:
+        return False
+    if len(parts) == 1:
+        # A single word that is itself a stop-word ('have', 'act' aside) is
+        # prose, never a book: 'we HAVE 3 16 members' survived only because the
+        # stop-word test used to run on the multi-word branch alone.
+        if parts[0] in _BOOK_STOP_WORDS:
+            return False
+        # Single local-language name: plausible if long enough not to be noise
+        # ('job' is 3, so 3 keeps it, while 'at'/'is'/'we' are rejected).
+        return len(parts[0]) >= 3
+    # A multi-word candidate is only credible when EVERY word could belong to a
+    # book name. It must contain no stop-words: sentence fragments detected as
+    # books all carried one ("turn WITH me TO page", "meeting IS AT", "had a
+    # job"). Real multi-word names never do - "abena roma", "nyimbo ya
+    # solomoni", "song of solomon", "1 mafumu" - so this rejects the phantom
+    # triggers while leaving local-language names to the server's alias table.
+    if any(word in _BOOK_STOP_WORDS for word in parts):
+        return False
+    # Guard against long runs of ordinary words being read as one book name.
+    return len(parts) <= 4
+
+
+def _lead_in_precedes_book(raw_book, stripped_book):
+    """True when a bare STOP-WORD was removed from directly in front of `book`.
+
+    Distinguishes a DELIBERATE reference from prose that merely survived
+    `strip_lead_in`. "Act 2:4" keeps its book as the whole capture and is real;
+    "the act 2 4 was great" only becomes "act" because "the" was stripped, which
+    means the speaker was describing an act, not naming the book of Acts.
+
+    Only an immediate stop-word counts. Purpose-built lead-ins are NOT
+    stop-words ("read", "turn to", "open"), so a genuine spoken command such as
+    "Let us read John 3:16" -> "john" keeps working: "read" is a lead-in cue,
+    whereas "the"/"we" are filler that real references do not carry.
+    """
+    raw = " ".join((raw_book or "").split()).lower()
+    stripped = " ".join((stripped_book or "").split()).lower()
+    if not raw or not stripped or raw == stripped:
+        return False
+    # Only a single surviving word is ambiguous enough to need this guard.
+    if len(stripped.split()) != 1 or stripped not in _KNOWN_BOOKS:
+        return False
+    raw_parts = raw.split()
+    stripped_parts = stripped.split()
+    # The words removed from the front of the capture.
+    removed = raw_parts[: len(raw_parts) - len(stripped_parts)]
+    if not removed:
+        return False
+    # Only the word IMMEDIATELY before the book can turn prose into a "book".
+    if removed[-1] not in _BOOK_STOP_WORDS:
+        return False
+    # A CUE phrase ending in a stop-word is a deliberate command, not prose:
+    # 'turn TO Psalm 23' and 'go TO John 3' must keep working, while 'the act'
+    # and 'we have' are bare filler and must not. The cue is recognised by the
+    # word BEFORE the stop-word (turn/go/look/read/open...).
+    if len(removed) >= 2 and removed[-2] in _BOOK_CUE_WORDS:
+        return False
+    return True
+
+# Spoken lead-ins that Whisper folds into the front of a detected book name:
+# "Let us read John 3:16" -> book "Let us read John". Left alone the resolver
+# looks up "let us read john", finds no row, and the overlay stays blank with
+# no error at all - the hardest kind of failure to diagnose during a service.
+#
+# Only LEADING words are removed, so numbered books ("1 John"), ordinals
+# ("First John") and multi-word names ("Song of Solomon") are untouched.
+_LEAD_IN_RE = re.compile(
+    r"^(?:"
+    r"let\s+us|let's|lets|we|please|now|and|so|then|alright|"
+    r"okay|ok|well|read|turn\s+to|go\s+to|looking\s+at|look\s+at|"
+    r"open|see|from|the|book|of"
+    r")\s+",
+    re.IGNORECASE,
+)
+
+
+def strip_lead_in(book):
+    """Removes spoken lead-in words folded into a detected book name.
+
+    Looped so several lead-ins in a row ("Now let us read John") are all
+    removed. Falls back to the original text if everything would be stripped,
+    so a book name is never reduced to nothing.
+    """
+    cleaned = " ".join(book.split())
+    if not cleaned:
+        return book
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = _LEAD_IN_RE.sub("", cleaned).strip()
+    return cleaned or book
+
 
 def words_to_number(text):
     """Converts a spoken number phrase to an int (e.g. 'twenty one' -> 21).
@@ -178,11 +387,28 @@ def parse_verse_reference(text):
     ("twenty three", "one hundred and fifty") resolve correctly. A bare
     two-number form with no separator ("First John four eight") is split into
     chapter/verse, unless the first word binds ("twenty three" stays 23).
+
+    A candidate book must pass `looks_like_book` before a trigger is returned.
+    Without that check ordinary speech produced phantom references -
+    "the act 2 4 was great" became book "act", resolved to ACTS, and put the
+    wrong verse on air.
     """
     digit_match = verse_pattern.search(text)
     if digit_match:
-        book, chapter, verse = digit_match.groups()
-        return " ".join(book.split()), chapter, verse
+        raw_book, chapter, verse = digit_match.groups()
+        # Decide on the RAW capture, before lead-ins are stripped: a genuine
+        # reference ("Act 2:4") is already a bare book name, while a sentence
+        # fragment ("the act 2 4 was great", "we have 3 16") still carries the
+        # stop-word that proves it is prose. Checking after stripping would see
+        # only "act"/"have" and lose that evidence.
+        if not looks_like_book(raw_book):
+            return None
+        book = strip_lead_in(raw_book)
+        if not looks_like_book(book):
+            return None
+        if _lead_in_precedes_book(raw_book, book):
+            return None
+        return book, chapter, verse
 
     tokens = text.split()
 
@@ -200,8 +426,10 @@ def parse_verse_reference(text):
     # ("John chapter three..." -> book "john", not "john chapter").
     while book_tokens and book_tokens[-1].lower().strip("-.:,") in ("chapter", "verse"):
         book_tokens.pop()
-    book = " ".join(book_tokens)
+    book = strip_lead_in(" ".join(book_tokens))
     if not re.search(r"[A-Za-z]", book):
+        return None
+    if not looks_like_book(book):
         return None
 
     # Split the remainder into maximal runs of number words.
@@ -278,13 +506,18 @@ def process_audio(audio_bytes, model, active_lang=None):
         if text:
             print(f"Recognized Speech: {text}")
 
-            # Voice-activated language switch takes priority over verse detection
+            # Voice-activated language switch. This used to `continue`, which
+            # meant a single sentence carrying BOTH a language command and a
+            # verse reference ("read John 3:16 in English") switched language
+            # and then threw the verse away. The switch is applied, then the
+            # verse is still looked for. A segment that is only a language
+            # command ("show tonga") still emits nothing but set_language,
+            # because parse_verse_reference finds no reference in it.
             lang_code = detect_language_command(text)
             if lang_code:
                 print(f"Language Switch Command -> {lang_code}")
                 switch_language(lang_code)
                 active_lang = lang_code
-                continue
 
             match = parse_verse_reference(text)
             if match:
@@ -439,6 +672,13 @@ def start_connection_manager(url=VPS_URL):
 
 
 def main():
+    if not STREAM_KEY:
+        print(
+            "WARNING: no stream key configured - the VPS will reject every\n"
+            "         verse with '[Auth]: Rejected'. Put the DABARSTREAM_KEY\n"
+            "         value in stream_key.txt next to client.py, or set the\n"
+            "         DABARSTREAM_KEY environment variable."
+        )
     connect_vps(VPS_URL)
     start_connection_manager(VPS_URL)
 

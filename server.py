@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import time
+from urllib.parse import quote
 
 from flask import (
     Flask,
@@ -126,6 +127,54 @@ TRANSLATION_LABELS = {
 
 # Currently active translation (voice/hotkey/panel switchable)
 CURRENT_LANG = "eng"
+
+# ---- Honest labelling for translations that have no rows ------------------
+# The UI offers every code in TRANSLATION_LABELS, but a code with no rows in
+# bible.db makes resolve_and_query_bible fall back to ENGLISH text while the
+# overlay still prints the local-language label ("Icibemba", "Chitonga"...).
+# On air that reads as a broken translation, so the existence of the
+# translation is probed once per code and the label says plainly when English
+# is what is actually on screen.
+#
+# Chitonga ('ton') is the known case: the UI and hotkey 4 offer it, but the
+# deployed bible.db ships eng/bem/nya only.
+_TRANSLATION_HAS_DATA = {}
+
+
+def translation_has_data(code, db_path=None):
+    """True when `code` has at least one row. Cached per (db, code).
+
+    One indexed existence probe per translation, so the cost is paid once for
+    the life of the process. A probe failure returns True: never let a
+    diagnostic degrade a live broadcast.
+    """
+    if code == "eng":
+        return True
+    db_path = db_path or DB_PATH
+    cache_key = (db_path, code)
+    cached = _TRANSLATION_HAS_DATA.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM verses WHERE translation_code=? LIMIT 1", (code,)
+        )
+        found = cursor.fetchone() is not None
+        conn.close()
+    except Exception:  # noqa: BLE001 - a probe must never block a verse
+        found = True
+    _TRANSLATION_HAS_DATA[cache_key] = found
+    return found
+
+
+def lang_label_for(code, db_path=None):
+    """Overlay label, honest when the requested translation has no rows."""
+    label = TRANSLATION_LABELS.get(code, code)
+    if code != "eng" and not translation_has_data(code, db_path):
+        return label + " (English shown)"
+    return label
 
 # Shared secret protecting the Socket.IO control events. Set DABARSTREAM_KEY
 # in the environment on BOTH the VPS (server) and the streaming PC (client,
@@ -446,7 +495,7 @@ def resolve_book(raw_book: str) -> str:
 
 
 def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "eng",
-                            db_path: str = None):
+                            db_path: str = None, with_source: bool = False):
     """
     Parses verbal shortcuts (in any supported language) and queries the
     database for the requested translation. Falls back to the English
@@ -454,6 +503,18 @@ def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "e
 
     `db_path` is resolved at CALL time (not import time) so tests and the
     desktop runtime can point at a different database.
+
+    Returns the 4-tuple `(book_name, chapter, verse, text)` by default, or the
+    5-tuple `(book_name, chapter, verse, text, served_code)` when
+    `with_source=True`. `served_code` is the translation the row ACTUALLY came
+    from, which differs from `translation_code` whenever the fallback fired.
+    Callers need that to avoid printing an English line twice: the overlay
+    shows `text` plus `text_eng`, and on a fallback both are the same English
+    string, so the verse appeared duplicated on air.
+
+    The `served_code` uses the row's own `translation_code` column, read back
+    from the database, rather than being assumed - so it stays correct even if
+    an alias resolves to a row stored under a different code.
     """
     db_path = db_path or DB_PATH
     try:
@@ -462,7 +523,7 @@ def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "e
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT book_name, chapter, verse, text FROM verses "
+            "SELECT book_name, chapter, verse, text, translation_code FROM verses "
             "WHERE translation_code=? AND book_normalized=? AND chapter=? AND verse=?",
             (translation_code, target_book, int(chapter), int(verse)),
         )
@@ -470,13 +531,21 @@ def resolve_and_query_bible(raw_book, chapter, verse, translation_code: str = "e
         if res is None and translation_code != "eng":
             # Language fallback: keep coordinates, use English text
             cursor.execute(
-                "SELECT book_name, chapter, verse, text FROM verses "
+                "SELECT book_name, chapter, verse, text, translation_code FROM verses "
                 "WHERE translation_code='eng' AND book_normalized=? AND chapter=? AND verse=?",
                 (target_book, int(chapter), int(verse)),
             )
             res = cursor.fetchone()
         conn.close()
-        return res
+        if res is None:
+            return None
+        display_book, ch, vs, text, served_code = res
+        # An older schema (or a hand-built row) may lack translation_code; the
+        # requested code is then the only honest answer.
+        served_code = served_code or translation_code
+        if with_source:
+            return display_book, ch, vs, text, served_code
+        return display_book, ch, vs, text
     except Exception as e:
         print(f"[Resolver Error]: Mapping failed - {e}")
         return None
@@ -525,10 +594,24 @@ def health():
     Keys are additive: "status" is always present so existing checks keep
     working, and the database fields let one curl confirm that bible.db was
     actually deployed (a missing database serves no verses but still runs).
+
+    "status" reports READINESS, not just liveness: a process that is up but
+    cannot serve a single verse is useless, yet it previously answered
+    {"status": "ok"} - so an uptime check, the deploy runbook, and any future
+    alerting all saw a healthy service that served nothing. It is now
+    "degraded" in that case, with "ready": false stating the same thing
+    explicitly for monitors that prefer a boolean.
+
+    The HTTP code stays 200 on purpose: the socket is genuinely accepting
+    connections, and a 503 would make a load balancer pull a replica that is
+    still useful for diagnosing the fault.
     """
     info = {"status": "ok"}
     info["db_path"] = os.path.abspath(DB_PATH)
     info["db_exists"] = os.path.exists(DB_PATH)
+    info["verses"] = 0
+    info["translations"] = 0
+    ready = False
     if info["db_exists"]:
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -538,10 +621,16 @@ def health():
             cursor.execute("SELECT COUNT(DISTINCT translation_code) FROM verses")
             info["translations"] = cursor.fetchone()[0]
             conn.close()
+            # A database with the table but no rows is still unservable.
+            ready = info["verses"] > 0
+            if not ready:
+                info["db_error"] = "database has no verses"
         except Exception as exc:  # noqa: BLE001 - report, never 500
             info["db_error"] = f"{type(exc).__name__}: {exc}"
     else:
         info["db_error"] = "bible.db not found next to server.py"
+    info["ready"] = ready
+    info["status"] = "ok" if ready else "degraded"
     return info
 
 
@@ -566,7 +655,7 @@ def api_verse():
         return jsonify({"error": "chapter/verse out of range"}), 400
 
     lang = normalize_lang(request.args.get("lang")) or "eng"
-    row = resolve_and_query_bible(book, chapter, verse, lang)
+    row = resolve_and_query_bible(book, chapter, verse, lang, with_source=True)
     if row is None:
         return jsonify({
             "error": "no row for that book/chapter/verse/translation",
@@ -574,11 +663,18 @@ def api_verse():
             "chapter": chapter, "verse": verse, "lang": lang,
         }), 404
 
-    display_book, ch, vs, text = row
+    display_book, ch, vs, text, served_code = row
+    # Report the translation actually served: a missing local language falls
+    # back to English, and labelling that English row "Chinyanja" would send
+    # the operator looking for a translation bug that is really a data gap.
+    lang = served_code
     payload = {
         "book": display_book, "chapter": ch, "verse": vs, "text": text,
-        "lang": lang, "lang_label": TRANSLATION_LABELS.get(lang, lang),
+        "lang": lang, "lang_label": lang_label_for(lang),
     }
+    # Only add the English subtitle when it is a genuinely different line: on a
+    # fallback `text` is already English, so a "translation" would be the same
+    # verse printed twice.
     if lang != "eng":
         english = resolve_and_query_bible(book, chapter, verse, "eng")
         if english:
@@ -632,7 +728,7 @@ CONTROL_HTML = """
                display: flex; flex-direction: column; align-items: center; padding: 30px; }
         h1 { font-size: 20px; }
         .row { display: flex; gap: 10px; margin: 10px 0; flex-wrap: wrap; justify-content: center; }
-        button, select, input { padding: 10px 16px; border-radius: 6px; border: 1px solid #444;
+        button, select, input, textarea { padding: 10px 16px; border-radius: 6px; border: 1px solid #444;
                background: #16213e; color: #eee; font-size: 15px; cursor: pointer; }
         button:hover { background: #0f3460; }
         button.active { background: #e94560; border-color: #e94560; }
@@ -641,6 +737,7 @@ CONTROL_HTML = """
         input { width: 80px; }
         input.book { width: 160px; }
         input.key { width: 200px; }
+        textarea { width: 100%; max-width: 520px; font-family: inherit; }
         .danger { margin-top: 10px; }
     </style>
 </head>
@@ -655,6 +752,15 @@ CONTROL_HTML = """
         <input id="verse" type="number" min="1" placeholder="Vs">
         <button type="submit">Send Verse</button>
     </form>
+    <div class="row"><input class="book" id="slide-title" placeholder="Slide title">
+        <button id="slide-btn">Send Slide</button></div>
+    <div class="row"><textarea id="slide-lines" rows="3"
+        placeholder="Slide lines - one per row"></textarea></div>
+    <div class="row"><input id="timer-minutes" type="number" min="0.1" step="0.1" placeholder="Min">
+        <input class="book" id="timer-label" placeholder="Timer label">
+        <button id="timer-start">Start Timer</button>
+        <button id="timer-stop">Stop Timer</button>
+        <button id="timer-clear">Clear Timer</button></div>
     <div class="row danger"><button id="clear-btn">Clear Overlay</button></div>
     <div id="status"></div>
     <script>
@@ -714,6 +820,7 @@ CONTROL_HTML = """
                 book: document.getElementById('book').value,
                 chapter: document.getElementById('chapter').value,
                 verse: document.getElementById('verse').value,
+                lang: currentLang,
                 key: streamKey(),
             });
             status.innerText = 'Verse sent.';
@@ -910,7 +1017,7 @@ def list_projects():
     for name in os.listdir(PROJECTS_DIR):
         if name.endswith(".json"):
             base = name[:-5].replace("_", " ")
-            out.append({"id": base, "url": "/api/projects/" + base})
+            out.append({"id": base, "url": "/api/projects/" + quote(base)})
     return sorted(out, key=lambda x: x["id"])
 
 
@@ -959,7 +1066,7 @@ def handle_set_language(data):
     print(f"[Language Switch]: Active translation is now '{lang}'")
     emit(
         "language_changed",
-        {"lang": lang, "lang_label": TRANSLATION_LABELS.get(lang, lang)},
+        {"lang": lang, "lang_label": lang_label_for(lang)},
         broadcast=True,
     )
 
@@ -979,19 +1086,24 @@ def handle_verse(data):
         f"{cleaned['book']} {cleaned['chapter']}:{cleaned['verse']} [{lang}]"
     )
     scripture = resolve_and_query_bible(
-        cleaned["book"], cleaned["chapter"], cleaned["verse"], lang
+        cleaned["book"], cleaned["chapter"], cleaned["verse"], lang,
+        with_source=True,
     )
 
     if not scripture:
         # Last-resort fallback to English coordinates
         scripture = resolve_and_query_bible(
-            cleaned["book"], cleaned["chapter"], cleaned["verse"], "eng"
+            cleaned["book"], cleaned["chapter"], cleaned["verse"], "eng",
+            with_source=True,
         )
-        if scripture:
-            lang = "eng"
 
     if scripture:
-        display_book, ch, vs, text = scripture
+        display_book, ch, vs, text, served_code = scripture
+        # The row may have come from English even when a local language was
+        # requested. Report what was ACTUALLY served, not what was asked for,
+        # so the label is honest and the dual-language block below can tell
+        # whether a distinct English line exists.
+        lang = served_code
         print(f"[Broadcasting to OBS Web client]: {display_book} {ch}:{vs} [{lang}]")
 
         payload = {
@@ -1000,11 +1112,14 @@ def handle_verse(data):
             "verse": vs,
             "text": text,
             "lang": lang,
-            "lang_label": TRANSLATION_LABELS.get(lang, lang),
+            "lang_label": lang_label_for(lang),
         }
 
         # Dual-language mode: also fetch the English text when the
         # requested translation is a local language, for side-by-side display.
+        # Only when it is genuinely a SECOND line: if `lang` already resolved
+        # to English, `text` IS the English text and adding `text_eng` printed
+        # the same verse twice on the overlay.
         if lang != "eng":
             english = resolve_and_query_bible(
                 cleaned["book"], cleaned["chapter"], cleaned["verse"], "eng"

@@ -64,6 +64,16 @@ mkdir -p "$APP_DIR"
 
 echo "[4/8] Installing application files..."
 cp -v server.py importer.py "$APP_DIR"/
+# The vendored Socket.IO browser client. Without it /js/socket.io.js falls back
+# to the cdnjs CDN, and a venue with no internet renders a BLANK overlay (the
+# page throws on an undefined `io`). Copied so the fix survives deployment.
+if [ -d static ]; then
+  mkdir -p "$APP_DIR/static"
+  cp -v static/* "$APP_DIR/static"/
+else
+  echo "  NOTE: no static/ directory - /js/socket.io.js will redirect to the CDN."
+  echo "        Vendored client missing: run the download in README 'Offline overlays'."
+fi
 if [ -f bible.db ]; then cp -v bible.db "$APP_DIR"/; fi
 
 echo "[5/8] Creating virtualenv and installing dependencies..."

@@ -43,6 +43,9 @@ Thumbs.db
 !.vscode/extensions.json
 .idea/
 
+# Shared stream secret; must match DABARSTREAM_KEY on the VPS
+stream_key.txt
+
 # Binaries and sensitive key material (never commit)
 *.exe
 *.key

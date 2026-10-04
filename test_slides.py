@@ -153,11 +153,39 @@ def test_control_route_still_serves():
 
 # --- Deployment health probe ---------------------------------------------------
 def test_health_reports_missing_database():
-    """With no bible.db beside server.py, /health must report it, not 500."""
+    """With no bible.db beside server.py, /health must report it, not 500.
+
+    Regression: /health answered {"status": "ok"} even with NO database, so an
+    uptime check - and the deploy runbook, which tells the operator to expect
+    "ok" - saw a healthy service that could not serve a single verse. A service
+    that is up but unservable must say so.
+    """
     payload = server_module.app.test_client().get("/health").get_json()
-    assert payload["status"] == "ok"          # liveness is unaffected
+    assert payload["status"] == "degraded"      # up, but not able to serve
+    assert payload["ready"] is False
+    assert payload["verses"] == 0
     assert payload["db_exists"] is False
     assert "db_error" in payload
+
+
+def test_health_reports_empty_database_as_degraded(tmp_path, monkeypatch):
+    """A database file that exists but holds no verses is still unservable.
+
+    This is the subtler half of the same bug: an empty (or wrongly built)
+    bible.db passed the old check because only file EXISTENCE was tested.
+    """
+    db = tmp_path / "empty.db"
+    from importer import init_database
+
+    init_database(str(db))          # creates the table, inserts no rows
+    monkeypatch.setattr(server_module, "DB_PATH", str(db))
+
+    payload = server_module.app.test_client().get("/health").get_json()
+    assert payload["db_exists"] is True
+    assert payload["verses"] == 0
+    assert payload["ready"] is False
+    assert payload["status"] == "degraded"
+    assert payload["db_error"] == "database has no verses"
 
 
 def test_health_reports_verse_and_translation_counts(tmp_path, monkeypatch):
@@ -176,6 +204,7 @@ def test_health_reports_verse_and_translation_counts(tmp_path, monkeypatch):
 
     payload = server_module.app.test_client().get("/health").get_json()
     assert payload["status"] == "ok"
+    assert payload["ready"] is True
     assert payload["db_exists"] is True
     assert payload["verses"] == 2
     assert payload["translations"] == 2
